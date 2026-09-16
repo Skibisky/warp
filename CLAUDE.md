@@ -94,6 +94,10 @@ Individual checkers, after `make test` (all binaries land at the repo root):
 python3 tools/make_test_container.py /tmp/tiny.waste     # anything below needs a container
 ./test_forward /tmp/tiny.waste 3,7,11,5 out.bin 0        # forward pass; 0 = no generation steps
 WASTE_CHUNK=1 ./test_forward ...                         # chunked prefill instead of sequential
+WASTE_CHUNK=7 ./test_forward ...                         # ... in chunks of 7, which is how the
+                                                         # suite walks sizes across QSA's 4-token
+                                                         # blocks; test_forward reports how many
+                                                         # tokens the batched path actually took
 ./test_container /tmp/tiny.waste/experts-L0.bin 2        # ONE bank + expected record count
 ./test_image /tmp && ./test_state MODEL && ./test_tokenizer MODEL "text"
 ./test_k3parts out.bin && uv run --with torch python tools/k3parts_ref.py out.bin
@@ -183,7 +187,7 @@ logging, signal handling and config files belong to the host, not the API.
 | file | role |
 |---|---|
 | `waste.c` | public API, memory planning, budget arithmetic |
-| `model.c` | container load + forward pass; one token per call (prefill is repeated steps, so decode is the only path) |
+| `model.c` | container load + forward pass; one token per call, plus a chunked prefill for the architectures that have one (Kimi/K3, and Qwen through `qwen_prefill`) |
 | `ecache.c` | bounded LFRU expert cache over the per-layer banks |
 | `kda.c`, `kda_neon.c` | Kimi Delta Attention recurrence |
 | `vq.c` | residual VQ decode; also built standalone as `libwastevq` for `convert.py` |

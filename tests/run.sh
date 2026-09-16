@@ -1694,6 +1694,50 @@ else
     # Chunked prefill against sequential decode, the check that has caught
     # every state bug in this engine: the two share no code above the layer
     # loop and must agree bit for bit.
+    #
+    # Bit-identical is half of it. The other half is that the batched path
+    # ran at all: prefill falls back to one waste_model_step per token for
+    # anything it cannot batch, and a fallback passes a logit comparison
+    # perfectly while doing none of the work. So every arm below also reads
+    # back the engine's own count of tokens it batched, and a zero fails.
+    #
+    # The sizes are chosen against what a chunk has to get right. QSA pools
+    # every `compress` tokens into a block and publishes them in order, the
+    # attention scores four selected tokens at a time, and a GDN recurrence
+    # carries state across the boundary: 2, 3, 5 and 7 all cut a 4-token
+    # block open, 37 tokens leave a partial chunk at every size, and 64 is
+    # one chunk for the whole prompt.
+    QCIDS=$(python3 -c "print(','.join(str((i * 7919) % 200 + 3) for i in range(37)))")
+    ./test_forward "$QWENC" "$QCIDS" "$TMP/qc_seq.bin" 0 >/dev/null 2>&1
+    qc_bad=""
+    for qcn in 1 2 3 4 5 7 8 16 37 64; do
+        qc_out=$(WASTE_CHUNK=$qcn ./test_forward "$QWENC" "$QCIDS" \
+                 "$TMP/qc_$qcn.bin" 0 2>&1)
+        qc_tok=$(printf '%s' "$qc_out" | sed -n 's/^chunked \([0-9]*\) tok.*/\1/p')
+        qc_gdn=$(printf '%s' "$qc_out" | sed -n 's/.*gdn \([0-9]*\).*/\1/p')
+        qc_qsa=$(printf '%s' "$qc_out" | sed -n 's/.*qsa \([0-9]*\)$/\1/p')
+        if [ ! -s "$TMP/qc_$qcn.bin" ]; then
+            qc_bad="$qc_bad size=$qcn(did not run)"
+        elif ! cmp -s "$TMP/qc_seq.bin" "$TMP/qc_$qcn.bin"; then
+            qc_bad="$qc_bad size=$qcn(logits)"
+        elif [ "${qc_tok:-0}" -lt 36 ]; then
+            # 37 tokens: at worst the last one is a chunk of one, which the
+            # engine hands to the per-token path on purpose.
+            qc_bad="$qc_bad size=$qcn(batched ${qc_tok:-0}/37)"
+        elif [ "${qc_gdn:-0}" -lt 36 ] || [ "${qc_qsa:-0}" -lt 36 ]; then
+            # The sublayers have their own fallbacks — a head stack that
+            # does not fit the recurrence scratch, a missing buffer — and a
+            # chunk that took one of them is a chunk that batched nothing
+            # where it matters.
+            qc_bad="$qc_bad size=$qcn(gdn ${qc_gdn:-0} qsa ${qc_qsa:-0})"
+        fi
+    done
+    if [ -n "$qc_bad" ]; then
+        no "Qwen chunked prefill:$qc_bad"
+    else
+        ok "Qwen chunked prefill is bit-identical at every chunk size, and batched"
+    fi
+
     WASTE_CHUNK=1 ./test_forward "$QWENC" 3,7,11 "$TMP/qwen_chunk.bin" 0 \
         >/dev/null 2>&1
     if [ ! -s "$TMP/qwen_chunk.bin" ]; then

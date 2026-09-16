@@ -96,6 +96,87 @@ void waste_mvq4_rows_i8mm(int b, int e, void *p)
     }
 }
 
+/* The chunk form. The token loop sits inside the weight loads: a pair of
+ * weight rows is unpacked once and multiplied into up to MVQ4M_TILE
+ * tokens' planes before the next eight bytes are touched. Every token's
+ * accumulation walks the same groups in the same order it does in the
+ * matvec above, so a chunked prefill and a token-at-a-time decode produce
+ * the same bits (tests/run.sh checks exactly that, at every chunk size). */
+#define MVQ4M_TILE 8
+
+void waste_mvq4_rows_i8mm_multi(int b, int e, void *p)
+{
+    const mvq4m_arg *a = (const mvq4m_arg *)p;
+    const int ng = a->ng, g = a->group, T = a->T;
+    const uint8x16_t m0f = vdupq_n_u8(0x0f);
+    const int8x16_t  m8  = vdupq_n_s8(8);
+    for (int t0 = 0; t0 < T; t0 += MVQ4M_TILE) {
+        const int tn = T - t0 < MVQ4M_TILE ? T - t0 : MVQ4M_TILE;
+        int o = b;
+        for (; o + 2 <= e; o += 2) {
+            const uint8_t *r0 = a->W + (size_t)o * a->rowbytes;
+            const uint8_t *r1 = r0 + a->rowbytes;
+            float acc0[MVQ4M_TILE] = { 0 }, acc1[MVQ4M_TILE] = { 0 };
+            for (int k = 0; k < ng; k++) {
+                int32x4_t d[MVQ4M_TILE];
+                for (int t = 0; t < tn; t++) d[t] = vdupq_n_s32(0);
+                const uint8_t *q0 = r0 + (size_t)k * g / 2;
+                const uint8_t *q1 = r1 + (size_t)k * g / 2;
+                for (int j = 0; j < g / 2; j += 8) {
+                    const uint8x16_t by = vcombine_u8(vld1_u8(q0 + j), vld1_u8(q1 + j));
+                    const int8x16_t lo =
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(by, m0f)), m8);
+                    const int8x16_t hi =
+                        vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(by, 4)), m8);
+                    for (int t = 0; t < tn; t++) {
+                        const int8_t *xe = a->xq + (size_t)(t0 + t) * a->xqstride
+                                         + (size_t)k * 2 * g;
+                        d[t] = vmmlaq_s32(d[t], lo, vld1q_s8(xe + 2 * j));
+                        d[t] = vmmlaq_s32(d[t], hi, vld1q_s8(xe + g + 2 * j));
+                    }
+                }
+                const float w0 = waste_f16(a->ws[(size_t)o * ng + k]);
+                const float w1 = waste_f16(a->ws[(size_t)(o + 1) * ng + k]);
+                for (int t = 0; t < tn; t++) {
+                    const float sx = a->xs[(size_t)(t0 + t) * a->xsstride + k];
+                    acc0[t] += w0 * sx *
+                        (128.0f * (float)vgetq_lane_s32(d[t], 0) + (float)vgetq_lane_s32(d[t], 1));
+                    acc1[t] += w1 * sx *
+                        (128.0f * (float)vgetq_lane_s32(d[t], 2) + (float)vgetq_lane_s32(d[t], 3));
+                }
+            }
+            for (int t = 0; t < tn; t++) {
+                float *y = a->y + (size_t)(t0 + t) * a->ystride;
+                y[o] = acc0[t]; y[o + 1] = acc1[t];
+            }
+        }
+        for (; o < e; o++) {
+            const uint8_t *row = a->W + (size_t)o * a->rowbytes;
+            for (int t = 0; t < tn; t++) {
+                const int8_t *xq = a->xq + (size_t)(t0 + t) * a->xqstride;
+                const float *xs = a->xs + (size_t)(t0 + t) * a->xsstride;
+                float acc = 0;
+                for (int k = 0; k < ng; k++) {
+                    const uint8_t *q0 = row + (size_t)k * g / 2;
+                    const int8_t *xe = xq + (size_t)k * 2 * g;
+                    const int8_t *xo = xe + g;
+                    long dh = 0, dl = 0;
+                    for (int j = 0; j < g / 2; j++) {
+                        const int wl = (int)(q0[j] & 0x0f) - 8;
+                        const int wh = (int)(q0[j] >> 4) - 8;
+                        const int blk = (j >> 3) * 16, sl = j & 7;
+                        dh += (long)wl * xe[blk + sl] + (long)wh * xo[blk + sl];
+                        dl += (long)wl * xe[blk + 8 + sl] + (long)wh * xo[blk + 8 + sl];
+                    }
+                    acc += waste_f16(a->ws[(size_t)o * ng + k]) * xs[k] *
+                           (128.0f * (float)dh + (float)dl);
+                }
+                a->y[(size_t)(t0 + t) * a->ystride + o] = acc;
+            }
+        }
+    }
+}
+
 #else
 /* Compiled into every ARM build, so the symbol exists even where the flag
  * did not take. The dispatcher checks the runtime bit and never calls it
@@ -105,5 +186,12 @@ void waste_mvq4_rows_i8mm(int b, int e, void *p)
 {
     const mvq4_arg *a = (const mvq4_arg *)p;
     for (int o = b; o < e; o++) a->y[o] = 0.0f;
+}
+
+void waste_mvq4_rows_i8mm_multi(int b, int e, void *p)
+{
+    const mvq4m_arg *a = (const mvq4m_arg *)p;
+    for (int t = 0; t < a->T; t++)
+        for (int o = b; o < e; o++) a->y[(size_t)t * a->ystride + o] = 0.0f;
 }
 #endif

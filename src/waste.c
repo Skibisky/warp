@@ -573,7 +573,14 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
                   2ull * (ctx_tokens / ikp + 1) * 4 +
                   (uint64_t)(ihd * idm + ihd) * 4;
     }
-    /* chunked prefill, allocated on first use and never freed */
+    /* chunked prefill, allocated on first use and never freed.
+     *
+     * Qwen's chunk (qwen_chunk_alloc) is a different set of buffers — its
+     * streams, the mix's rows, the two attention stacks — and is not counted
+     * separately because it is smaller than the m->cq term below, which a
+     * Qwen load never allocates: about T*(3*hc + 8) * hidden * 4 against
+     * (2T+1) LUTs. Over-counting is the safe direction; under-counting is
+     * the failure this arithmetic exists to prevent. */
     sc += (uint64_t)T * hidden * 4 * 3;                     /* cx/cnorm/cresid */
     {   /* Decode keeps three LUTs and chunked prefill keeps 2*T+1.
          * Both allocations use the container's VQ geometry. */

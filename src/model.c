@@ -592,6 +592,7 @@ static void mvq4_rows_sdot(int b, int e, void *p)
  * predicate, and this is that predicate. */
 #if defined(__ARM_NEON) || defined(__aarch64__)
 void waste_mvq4_rows_i8mm(int b, int e, void *p);
+void waste_mvq4_rows_i8mm_multi(int b, int e, void *p);
 #endif
 
 /* ---- Q4G x int16 activations (SMLAL) ------------------------------------
@@ -3446,6 +3447,8 @@ void waste_model_free(waste_model *m)
             if (m->bank[L].fd[s] >= 0) close(m->bank[L].fd[s]);
     }
     free(m->hcx);
+    free(m->qhx); free(m->qnorm); free(m->qgate); free(m->qlo);
+    free(m->qx); free(m->qblk); free(m->qinj); free(m->qxq); free(m->qxs);
     free(m->ple_ring);
     free(m->ple_emb);
     free(m->gdn_g);
@@ -6820,6 +6823,15 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
 
 int waste_model_chunk_max(const waste_model *m) { (void)m; return WASTE_CHUNK_MAX; }
 
+void waste_model_chunk_stats(const waste_model *m, long *calls, long *tokens,
+                             long *gdn, long *qsa)
+{
+    if (calls) *calls = m->chunk_calls;
+    if (tokens) *tokens = m->chunk_tokens;
+    if (gdn) *gdn = m->chunk_gdn;
+    if (qsa) *qsa = m->chunk_qsa;
+}
+
 /* Y[T][out] = X[T][in] . W^T, parallel over output rows. */
 typedef struct {
     float *Y; const float *W, *X; int in, out, T;
@@ -7279,28 +7291,24 @@ static int clamp_token(const waste_model *m, int token)
     return 0;
 }
 
+static const float *qwen_prefill(waste_model *m, const int *tokens, int n, int pos0);
+
 const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
                                  int pos0)
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden;
     if (n <= 0) return m->logits;
-    if (c->arch_qwen) {
-        const float *lg = NULL;
-        for (int t = 0; t < n; t++) {
-            lg = waste_model_step(m, tokens[t], pos0 + t, NULL);
-            if (!lg) return NULL;
-        }
-        return lg;
-    }
+    if (c->arch_qwen) return qwen_prefill(m, tokens, n, pos0);
     if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
-    /* The chunked path carries one residual per token and one dense
+    /* This chunked path carries one residual per token and one dense
      * attention per layer. mHC's parallel streams and the DSA indexer's
      * per-token pool bookkeeping are neither, and a chunk that quietly ran
      * without them would differ from the same prompt decoded one token at a
      * time — the exact failure WASTE_CHUNK exists to be checked against. So
-     * a container with either is prefilled the way it decodes, one token
-     * per call, until the chunked path grows both. */
+     * a GLM or DeepSeek container with either is still prefilled the way it
+     * decodes, one token per call. Qwen went the other way above: it has
+     * both, and qwen_prefill carries them. */
     if (c->hc_mult || c->index_topk) {
         const float *out = NULL;
         for (int t = 0; t < n; t++) {
@@ -7311,6 +7319,8 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
     }
     dump_pos0 = pos0;
     if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
+    m->chunk_calls++;
+    m->chunk_tokens += n;
     /* mla_layer writes one latent per position with no bound of its own,
      * so the bound is here. The public API refuses an over-long prompt
      * before it reaches this; a direct model.h caller gets a NULL. */
@@ -7949,7 +7959,19 @@ static void qsa_attn_range(int b, int e, void *p)
                                   a->scr + (size_t)h * (size_t)a->n_sel);
 }
 
-static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, int pos)
+static void matvec_t_multi(waste_model *m, float *Y, size_t ystride,
+                           const waste_tensor *t, const float *X, size_t xstride,
+                           int out, int in, int T);
+
+/* `proj`, when given, is this token's four projections already computed —
+ * q+gate, k, v and the indexer's rows, in that order and contiguous, which
+ * is the layout the local pointers below expect. `attn_out`, when given,
+ * takes the gated attention vector and leaves the output projection to the
+ * caller. Both are what the chunked prefill passes so that the projections
+ * on either side of the sequential middle can be batched over a chunk;
+ * decode passes neither and the middle is the same code either way. */
+static void qwen_qsa_layer_ex(waste_model *m, int L, const float *in, float *out,
+                              int pos, float *proj, float *attn_out)
 {
     const waste_config *c = &m->cfg;
     const int hid = c->hidden, Hq = c->n_heads, Hkv = c->qsa_n_kv, D = c->qsa_head_dim;
@@ -7961,12 +7983,12 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
     if (!m->qsa_q || !m->qsa_gate || !m->qsa_attn || !m->qsa_sel ||
         !m->qsa_kf || !m->qsa_vf || !m->qsa_rawk[L])
         return;
-    float *qgate = m->tmp;
+    float *qgate = proj ? proj : m->tmp;
     float *k = qgate + qd * 2;
     float *v = k + kvd;
     float *idx = v + kvd;
-    {
-        const mvb_item proj[4] = {
+    if (!proj) {
+        const mvb_item pr[4] = {
             { qgate, waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight",
                                          c->prefix, L)), qd * 2 },
             { k, waste_find(m, tname("%smodel.layers.%d.self_attn.k_proj.weight",
@@ -7976,7 +7998,7 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
             { idx, waste_find(m, tname("%smodel.layers.%d.self_attn.indexer.index_qk_proj.weight",
                                        c->prefix, L)), idxd },
         };
-        matvec_t_batch(m, in, hid, proj, 4);
+        matvec_t_batch(m, in, hid, pr, 4);
     }
     float *q = m->qsa_q, *gate = m->qsa_gate;
     for (int h = 0; h < Hq; h++) {
@@ -8097,8 +8119,61 @@ static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, i
     PROF_END(P_QSAK);
     for (int i = 0; i < qd; i++)
         attn[i] *= 1.0f / (1.0f + expf(-gate[i]));
+    if (attn_out) {
+        memcpy(attn_out, attn, (size_t)qd * sizeof(float));
+        return;
+    }
     matvec_t(m, out, waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight",
                                          c->prefix, L)), attn, hid, qd);
+}
+
+static void qwen_qsa_layer(waste_model *m, int L, const float *in, float *out, int pos)
+{
+    qwen_qsa_layer_ex(m, L, in, out, pos, NULL, NULL);
+}
+
+/* QSA over a chunk: the four input projections and the output projection
+ * batched, the middle — norms, RoPE, publishing each token's keys into the
+ * pool, block selection and attention — one token at a time and in order,
+ * because every token selects over the blocks the ones before it closed. */
+static void qwen_qsa_chunk(waste_model *m, int L, const float *X, size_t xstride,
+                           float *OUT, size_t ostride, int pos0, int T)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, Hq = c->n_heads, Hkv = c->qsa_n_kv, D = c->qsa_head_dim;
+    const int Dk = c->idx_head_dim;
+    const int qd = Hq * D, kvd = Hkv * D;
+    const int idxd = (c->idx_n_heads + c->idx_kv_heads) * Dk;
+    const size_t pstride = (size_t)(2 * qd + 2 * kvd + idxd);
+    if (!m->qproj || !m->qattn) {
+        for (int t = 0; t < T; t++)
+            qwen_qsa_layer(m, L, X + (size_t)t * xstride, OUT + (size_t)t * ostride,
+                           pos0 + t);
+        return;
+    }
+    m->chunk_qsa += T;
+    matvec_t_multi(m, m->qproj, pstride,
+                   waste_find(m, tname("%smodel.layers.%d.self_attn.q_proj.weight",
+                                       c->prefix, L)), X, xstride, qd * 2, hid, T);
+    matvec_t_multi(m, m->qproj + 2 * qd, pstride,
+                   waste_find(m, tname("%smodel.layers.%d.self_attn.k_proj.weight",
+                                       c->prefix, L)), X, xstride, kvd, hid, T);
+    matvec_t_multi(m, m->qproj + 2 * qd + kvd, pstride,
+                   waste_find(m, tname("%smodel.layers.%d.self_attn.v_proj.weight",
+                                       c->prefix, L)), X, xstride, kvd, hid, T);
+    matvec_t_multi(m, m->qproj + 2 * qd + 2 * kvd, pstride,
+                   waste_find(m, tname("%smodel.layers.%d.self_attn.indexer.index_qk_proj.weight",
+                                       c->prefix, L)), X, xstride, idxd, hid, T);
+    for (int t = 0; t < T; t++) {
+        memset(OUT + (size_t)t * ostride, 0, (size_t)hid * sizeof(float));
+        memset(m->qattn + (size_t)t * qd, 0, (size_t)qd * sizeof(float));
+        qwen_qsa_layer_ex(m, L, X + (size_t)t * xstride, OUT + (size_t)t * ostride,
+                          pos0 + t, m->qproj + (size_t)t * pstride,
+                          m->qattn + (size_t)t * qd);
+    }
+    matvec_t_multi(m, OUT, ostride,
+                   waste_find(m, tname("%smodel.layers.%d.self_attn.o_proj.weight",
+                                       c->prefix, L)), m->qattn, (size_t)qd, hid, qd, T);
 }
 
 /* One routed expert through the row-parallel kernels, into `acc`.
@@ -8153,6 +8228,14 @@ static float qwen_shared_expert(waste_model *m, int L, const float *in, float *a
     return sg;
 }
 
+/* The routed experts of one token: the hint, whichever of the three
+ * schedules the cache chooses, and the sum over the ranks. Split out of
+ * qwen_moe_layer so the chunked prefill can run it per token while the
+ * router and the shared expert around it are batched over the chunk.
+ *
+ * `shared_pre`, when given, is cleared if the serial fallback runs: that
+ * path uses m->ff, where the caller may have parked the shared expert's
+ * projections. */
 static void qwen_moe_layer(waste_model *m, int L, const float *in, float *out, int *routed)
 {
     const waste_config *c = &m->cfg;
@@ -8432,22 +8515,18 @@ static int qwen_predict_next_moe(waste_model *m, int L, int *out, int n)
     return k;
 }
 
-static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
+/* One Qwen layer for one token: the whole of it, from the attention
+ * mix to the streams the next layer reads. Decode calls it per token;
+ * the chunked prefill calls it per token too, inside a loop over the
+ * chunk, with m->hcx pointed at that token's streams — so the two paths
+ * are not two implementations that have to be kept in agreement, they
+ * are one, and the chunk's only freedom is the order it visits things
+ * in. `routed`, when given, receives this layer's expert ids. */
+static void qwen_layer(waste_model *m, int L, int token, int pos, int *routed)
 {
-    dump_pos0 = pos;
     const waste_config *c = &m->cfg;
     const int hid = c->hidden, hc = c->hc_count;
-    {
-        const int cm = waste_model_ctx_max(m);
-        if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
-    }
-    waste_embed_row(m, token, m->x);
-    for (int b = 0; b < hc; b++)
-        memcpy(m->hcx + (size_t)b * hid, m->x, (size_t)hid * sizeof(float));
-
     float *block = m->h;
-    for (int L = 0; L < c->n_layers; L++) {
-        if (m->read_error) break;
         if (L == c->ple_layer) {
             PROF_START(P_QPLE);
             qwen_ple_inject(m, token);
@@ -8520,6 +8599,505 @@ static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
                 fclose(df);
             }
         }
+}
+
+typedef struct {
+    const float *x; size_t xstride;
+    int8_t *q; size_t qstride;
+    float *sc; size_t sstride;
+    int n, g, ng;
+} qa4c_arg;
+
+static void quant_act4_mm_chunk(int b, int e, void *p)
+{
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    const qa4c_arg *a = (const qa4c_arg *)p;
+    for (int k = b; k < e; k++) {
+        const int t = k / a->ng, gi = k % a->ng;
+        quant_act4_mm_group(a->x + (size_t)t * a->xstride, a->n, a->g, gi,
+                            a->q + (size_t)t * a->qstride,
+                            a->sc + (size_t)t * a->sstride);
+    }
+#else
+    (void)b; (void)e; (void)p;
+#endif
+}
+
+/* The mix over a chunk. Same six steps as qwen_hc_mix_t, in the same
+ * order, with the two projections batched: the norms and the gate work are
+ * per token and go to the pool as tasks over the whole chunk, and `down`
+ * and `up` read their weights once for all of the chunk's tokens.
+ *
+ * It is a second implementation of the same arithmetic, which is a thing
+ * worth avoiding and is avoided everywhere else in this file — decode's
+ * version quantizes inside the norm task (§86) and this one leaves it to
+ * the projection, so they are not one function with a count. What makes it
+ * safe is that tests/run.sh walks a prompt through every chunk size and
+ * compares with the token-at-a-time path bit for bit, and that it counts
+ * the tokens the batched path actually took. */
+typedef struct {
+    float *gate, *mixed, *inj;
+    const float *normed, *W;
+    size_t gstride, mstride, istride, nstride;
+    int hc, hid, n_mix, per;
+} hcgc_arg;
+
+static void hc_gate_mix_chunk(int b, int e, void *p)
+{
+    const hcgc_arg *a = (const hcgc_arg *)p;
+    for (int k = b; k < e; k++) {
+        const int t = k / a->per, s = k % a->per;
+        hcg_arg one = { a->gate + (size_t)t * a->gstride,
+                        a->mixed + (size_t)t * a->mstride,
+                        a->inj + (size_t)t * a->istride,
+                        a->normed + (size_t)t * a->nstride,
+                        a->W, a->hc, a->hid, a->n_mix };
+        hc_gate_mix_piece(s, s + 1, &one);
+    }
+}
+
+typedef struct {
+    float *o, *x;
+    const float *w;
+    int group, hc;
+    float eps;
+    const float *block, *inj;
+    size_t ostride, xstride, bstride, istride;
+} hcnc_arg;
+
+static void hc_norm_chunk(int b, int e, void *p)
+{
+    const hcnc_arg *a = (const hcnc_arg *)p;
+    for (int k = b; k < e; k++) {
+        const int t = k / a->hc, s = k % a->hc;
+        hcn_arg one = { a->o + (size_t)t * a->ostride, a->x + (size_t)t * a->xstride,
+                        a->w, a->group, a->eps,
+                        a->block ? a->block + (size_t)t * a->bstride : NULL,
+                        a->inj ? a->inj + (size_t)t * a->istride : NULL,
+                        0, 0, NULL, NULL };
+        hc_norm_range(s, s + 1, &one);
+    }
+}
+
+static void qwen_hc_mix_chunk(waste_model *m, int T, float *hcx, size_t hstride,
+                              const float *cblock, size_t bstride,
+                              const float *cinj, size_t cistride,
+                              const waste_tensor *nw, const waste_tensor *down,
+                              const waste_tensor *up, const waste_tensor *inject,
+                              int use_inj, float *mixed, size_t mstride,
+                              float *inj_w, size_t istride)
+{
+    const waste_config *c = &m->cfg;
+    const int hc = c->hc_count, hid = c->hidden, rank = c->hc_lowrank;
+    const size_t H = (size_t)hc * hid;
+    if (!nw || !nw->data || !down || !up) {
+        for (int t = 0; t < T; t++) {
+            if (cblock)
+                waste_qwen_hc_combine(hcx + (size_t)t * hstride,
+                                      cblock + (size_t)t * bstride,
+                                      cinj + (size_t)t * cistride, hc, hid,
+                                      hcx + (size_t)t * hstride);
+            memset(mixed + (size_t)t * mstride, 0, (size_t)hid * sizeof(float));
+            if (inj_w) memset(inj_w + (size_t)t * istride, 0, (size_t)hc * sizeof(float));
+        }
+        return;
+    }
+    /* The inject weights the combine uses are the previous mix's, and this
+     * mix is about to overwrite them: take a copy per token first. */
+    float *prev = NULL;
+    if (cblock) {
+        prev = m->qlo + (size_t)T * rank;   /* qlo has room after the rows */
+        for (int t = 0; t < T; t++)
+            memcpy(prev + (size_t)t * hc, cinj + (size_t)t * cistride,
+                   (size_t)hc * sizeof(float));
+    }
+    {
+        hcnc_arg na = { m->qnorm, hcx, nw->data, hid, hc, c->eps,
+                        cblock, prev, H, hstride, bstride, (size_t)hc };
+        waste_parallel_for_fast(T * hc, 1, hc_norm_chunk, &na);
+    }
+    matvec_t_multi(m, m->qlo, (size_t)rank, down, m->qnorm, H, rank, (int)H, T);
+    for (int t = 0; t < T; t++) {
+        float *lo = m->qlo + (size_t)t * rank;
+        for (int i = 0; i < rank; i++) lo[i] = silu(lo[i] / (float)hc);
+    }
+    matvec_t_multi(m, m->qgate, H, up, m->qlo, (size_t)rank, (int)H, rank, T);
+
+    const int want_inj = use_inj && inject && inj_w && hc <= 16;
+    const int inj_rows = want_inj && !inject->q && inject->data;
+    const int n_mix = (hid + HC_SPAN - 1) / HC_SPAN;
+    const int per = n_mix + (inj_rows ? hc : 0);
+    {
+        hcgc_arg ga = { m->qgate, mixed, m->qinj, m->qnorm,
+                        inj_rows ? inject->data : NULL,
+                        H, mstride, (size_t)(hc > 16 ? hc : 16), H,
+                        hc, hid, n_mix, per };
+        waste_parallel_for_each(T * per, hc_gate_mix_chunk, &ga, waste_pool_fast());
+    }
+    if (want_inj) {
+        for (int t = 0; t < T; t++) {
+            float *dst = inj_w + (size_t)t * istride;
+            if (!inj_rows)
+                matvec_t(m, m->qinj + (size_t)t * (hc > 16 ? hc : 16), inject,
+                         m->qnorm + (size_t)t * H, hc, (int)H);
+            const float *src = m->qinj + (size_t)t * (hc > 16 ? hc : 16);
+            for (int b = 0; b < hc; b++)
+                dst[b] = 2.0f / (1.0f + expf(-src[b] / (float)hc));
+        }
+    }
+}
+
+/* GDN over a chunk: the five projections batched, everything that carries
+ * state per token and in order.
+ *
+ * The conv has a ring per channel, the recurrence a state per head, and
+ * both are read and written by every token — so those stay a loop. What
+ * batches is the weights around them: in_proj_qkv alone is 13 MB a layer,
+ * read once here instead of once per token. */
+static void qwen_gdn_chunk(waste_model *m, int L, const float *X, size_t xstride,
+                           float *OUT, size_t ostride, int T)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, Hk = c->gdn_k_heads, Hv = c->gdn_v_heads;
+    const int Dk = c->gdn_k_dim, Dv = c->gdn_v_dim;
+    const int qkv = 2 * Hk * Dk + Hv * Dv, ZD = Hv * Dv;
+    const size_t H = (size_t)c->hc_count * hid;
+    for (int t = 0; t < T; t++)
+        memset(OUT + (size_t)t * ostride, 0, (size_t)hid * sizeof(float));
+    if (!m->gdn_g) return;
+    (void)H;
+    /* A head stack wider than the recurrence's scratch takes the per-token
+     * path, as decode does. */
+    if (Dv > GDN_SCRATCH || !m->qmix || !m->qz) {
+        for (int t = 0; t < T; t++)
+            qwen_gdn_layer(m, L, X + (size_t)t * xstride, OUT + (size_t)t * ostride);
+        return;
+    }
+    m->chunk_gdn += T;
+    float *mixed = m->qmix, *zall = m->qz, *normed = m->qnrm;
+    float *aall = m->qab, *ball = aall + (size_t)T * Hv;
+    matvec_t_multi(m, mixed, (size_t)qkv,
+                   waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_qkv.weight",
+                                       c->prefix, L)), X, xstride, qkv, hid, T);
+    matvec_t_multi(m, zall, (size_t)ZD,
+                   waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_z.weight",
+                                       c->prefix, L)), X, xstride, ZD, hid, T);
+    matvec_t_multi(m, aall, (size_t)Hv,
+                   waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_a.weight",
+                                       c->prefix, L)), X, xstride, Hv, hid, T);
+    matvec_t_multi(m, ball, (size_t)Hv,
+                   waste_find(m, tname("%smodel.layers.%d.linear_attn.in_proj_b.weight",
+                                       c->prefix, L)), X, xstride, Hv, hid, T);
+
+    const waste_tensor *cw = waste_find(m, tname("%smodel.layers.%d.linear_attn.conv1d.weight",
+                                                 c->prefix, L));
+    const waste_tensor *tA = waste_find(m, tname("%smodel.layers.%d.linear_attn.A_log",
+                                                 c->prefix, L));
+    const waste_tensor *tdt = waste_find(m, tname("%smodel.layers.%d.linear_attn.dt_bias",
+                                                  c->prefix, L));
+    const waste_tensor *tnw = waste_find(m, tname("%smodel.layers.%d.linear_attn.norm.weight",
+                                                  c->prefix, L));
+    const waste_tensor *top = waste_find(m, tname("%smodel.layers.%d.linear_attn.out_proj.weight",
+                                                  c->prefix, L));
+    if (!tA || !tA->data || !tdt || !tdt->data || !tnw || !tnw->data) return;
+
+    float *conv_y = m->tmp, *core = conv_y + qkv;
+    PROF_START(P_KDAK);
+    for (int t = 0; t < T; t++) {
+        float *mx = mixed + (size_t)t * qkv;
+        float *bt = ball + (size_t)t * Hv, *at = aall + (size_t)t * Hv;
+        if (cw && cw->data) {
+            gconv_arg ca = { c->conv_k, cw->data, m->conv[L], mx, conv_y };
+            waste_parallel_for_fast(qkv, 512, gdn_conv_range, &ca);
+        } else {
+            memcpy(conv_y, mx, (size_t)qkv * sizeof(float));
+        }
+        for (int h = 0; h < Hv; h++) bt[h] = 1.0f / (1.0f + expf(-bt[h]));
+        waste_qwen_gdn_decay(at, tA->data, tdt->data, Hv, m->gdn_g);
+        gdnf_arg fa = { { Hk, Hv, Dk, Dv, conv_y, conv_y + Hk * Dk,
+                          conv_y + 2 * Hk * Dk, m->gdn_g, bt, m->S[L], core },
+                        zall + (size_t)t * ZD, tnw->data, c->eps,
+                        normed + (size_t)t * ZD, 0, ZD, NULL, NULL };
+        waste_parallel_for_fast(Hv, 1, gdn_heads_out_range, &fa);
+    }
+    PROF_END(P_KDAK);
+    matvec_t_multi(m, OUT, ostride, top, normed, (size_t)ZD, hid, ZD, T);
+}
+
+/* Room for one chunk's streams: [token][hc][hidden]. Everything else a
+ * layer needs is per token and dies inside qwen_layer, so this is the only
+ * thing the chunk has to carry. */
+static int qwen_chunk_alloc(waste_model *m, int T)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, hc = c->hc_count, rank = c->hc_lowrank;
+    const size_t H = (size_t)hc * hid;
+    if (m->qchunk_cap >= T) return 0;
+    free(m->qhx); free(m->qnorm); free(m->qgate); free(m->qlo);
+    free(m->qx); free(m->qblk); free(m->qinj); free(m->qxq); free(m->qxs);
+    free(m->qnrm); free(m->qab); free(m->qmix); free(m->qz);
+    free(m->qproj); free(m->qattn);
+    m->qchunk_cap = 0;
+    /* The widest thing a batched projection reads is the flattened streams,
+     * and quant_act4_mm writes two int8 planes per element plus one scale
+     * per weight group (32 at the narrowest). */
+    const size_t wide = H > (size_t)hid ? H : (size_t)hid;
+    m->qhx   = (float *)calloc((size_t)T * H, sizeof(float));
+    m->qnorm = (float *)calloc((size_t)T * H, sizeof(float));
+    m->qgate = (float *)calloc((size_t)T * H, sizeof(float));
+    /* The low-rank rows, plus room after them for one copy of the inject
+     * weights per token: the combine inside a mix reads the previous mix's
+     * weights, which that mix is about to overwrite. */
+    m->qlo   = (float *)calloc((size_t)T * ((size_t)(rank > 0 ? rank : 1) + 16), sizeof(float));
+    m->qx    = (float *)calloc((size_t)T * hid, sizeof(float));
+    m->qblk  = (float *)calloc((size_t)T * hid, sizeof(float));
+    m->qinj  = (float *)calloc((size_t)T * (hc > 16 ? hc : 16), sizeof(float));
+    {   /* QSA's chunk rows: the four projections a token is scored from,
+         * laid out as one vector so the per-token core can read them in
+         * place, and the gated attention output the layer projects back. */
+        const size_t qd = (size_t)c->n_heads * (c->qsa_head_dim > 0 ? c->qsa_head_dim : 1);
+        const size_t kvd = (size_t)(c->qsa_n_kv > 0 ? c->qsa_n_kv : 1) *
+                           (c->qsa_head_dim > 0 ? c->qsa_head_dim : 1);
+        const size_t idxd = (size_t)(c->idx_n_heads + c->idx_kv_heads) *
+                            (c->idx_head_dim > 0 ? c->idx_head_dim : 1);
+        m->qproj = (float *)calloc((size_t)T * (2 * qd + 2 * kvd + idxd) + 64, sizeof(float));
+        m->qattn = (float *)calloc((size_t)T * qd + 64, sizeof(float));
+        if (!m->qproj || !m->qattn) return -1;
+    }
+    {   /* GDN's chunk rows: the projected stack, the gate stream, its value
+         * rows, and the two per-head gates. */
+        const size_t qkv = (size_t)2 * (c->gdn_k_heads > 0 ? c->gdn_k_heads : 1) *
+                           (c->gdn_k_dim > 0 ? c->gdn_k_dim : 1) +
+                           (size_t)(c->gdn_v_heads > 0 ? c->gdn_v_heads : 1) *
+                           (c->gdn_v_dim > 0 ? c->gdn_v_dim : 1);
+        m->qmix = (float *)calloc((size_t)T * qkv + 64, sizeof(float));
+        if (!m->qmix) return -1;
+        const size_t zd2 = (size_t)(c->gdn_v_heads > 0 ? c->gdn_v_heads : 1) *
+                           (size_t)(c->gdn_v_dim > 0 ? c->gdn_v_dim : 1);
+        m->qz = (float *)calloc((size_t)T * zd2 + 64, sizeof(float));
+        if (!m->qz) return -1;
+    }
+    {   /* GDN's chunk rows: its value stack, and the two per-head gates. */
+        const size_t zd = (size_t)(c->gdn_v_heads > 0 ? c->gdn_v_heads : 1) *
+                          (size_t)(c->gdn_v_dim > 0 ? c->gdn_v_dim : 1);
+        m->qnrm = (float *)calloc((size_t)T * zd + 64, sizeof(float));
+        m->qab  = (float *)calloc((size_t)T * 2 * (size_t)(c->gdn_v_heads > 0 ? c->gdn_v_heads : 1) + 64,
+                                  sizeof(float));
+        if (!m->qnrm || !m->qab) return -1;
+    }
+    m->qxq   = (int8_t *)calloc((size_t)T * 2 * wide + 64, 1);
+    m->qxs   = (float *)calloc((size_t)T * (wide / 32 + 2), sizeof(float));
+    if (!m->qhx || !m->qnorm || !m->qgate || !m->qlo || !m->qx || !m->qblk ||
+        !m->qinj || !m->qxq || !m->qxs) return -1;
+    m->qhx_cap = (size_t)T * H;
+    m->qchunk_cap = T;
+    return 0;
+}
+
+/* Y[t] = W . X[t] for a chunk of tokens, each token's arithmetic exactly
+ * matvec_t's.
+ *
+ * The point is the weights: a projection reads its rows once for the whole
+ * chunk instead of once per token, which is what makes a prefill cheaper
+ * per token than a decode step. Only the i8mm kernel has a chunk form —
+ * everything else loops matvec_t, which is the same answer at the same
+ * speed as before. */
+static void matvec_t_multi(waste_model *m, float *Y, size_t ystride,
+                           const waste_tensor *t, const float *X, size_t xstride,
+                           int out, int in, int T)
+{
+    if (T == 1) { matvec_t(m, Y, t, X, out, in); return; }
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    if (prequant_ok(t, in) && m->qxq && T <= m->qchunk_cap) {
+        const int g = t->group, ng = (in + g - 1) / g;
+        const size_t qstride = (size_t)2 * in, sstride = (size_t)ng;
+        const double t0 = prof_on ? pnow() : 0;
+        /* One task per (token, weight group): serial, this was 14 us a
+         * token in front of a projection the whole pool then waited for. */
+        {
+            qa4c_arg qa = { X, xstride, m->qxq, qstride, m->qxs, sstride, in, g, ng };
+            waste_parallel_for_fast(T * ng, 4, quant_act4_mm_chunk, &qa);
+        }
+        mvq4m_arg a = { Y, (const uint8_t *)t->q, t->qs, m->qxq, m->qxs,
+                        in, ng, g, t->rowbytes, T, ystride, qstride, sstride };
+        waste_parallel_for_work(out, mv_chunk(out, t->rowbytes),
+                                waste_mvq4_rows_i8mm_multi, &a,
+                                (size_t)out * t->rowbytes);
+        if (prof_on) {
+            const double dt = (pnow() - t0) / T;
+            pthread_mutex_lock(&prof_mu);
+            for (int i = 0; i < T; i++) tmv_account(t, out, in, dt, 0.0);
+            pthread_mutex_unlock(&prof_mu);
+        }
+        return;
+    }
+#endif
+    for (int i = 0; i < T; i++)
+        matvec_t(m, Y + (size_t)i * ystride, t, X + (size_t)i * xstride, out, in);
+}
+
+/* Qwen's prefill: the same layers in the same order, visited layer by
+ * layer over a chunk of tokens instead of token by token over the layers.
+ *
+ * Both orders are legal for a causal model — layer L of token t reads
+ * layer L-1 of tokens up to t, and this computes all of layer L-1 before
+ * any of layer L — and what the layer-major order buys is that a layer's
+ * weights are touched T times while they are warm rather than once per
+ * token through the whole trunk, and that the projections can batch (they
+ * do not yet; each token still goes through qwen_layer).
+ *
+ * What is *not* free to reorder is the state inside a layer: GDN's
+ * recurrence carries S from one token to the next, QSA publishes each
+ * token's keys into the pool before the next token selects over them, and
+ * PLE reads the n-gram history. So the token loop inside a layer runs
+ * forward, one token at a time, exactly as decode does.
+ *
+ * Only the last token's logits are asked for, so the final mixer and the
+ * head run once instead of T times. */
+static const float *qwen_prefill(waste_model *m, const int *tokens, int n, int pos0)
+{
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, hc = c->hc_count;
+    const size_t stride = (size_t)hc * hid;
+    if (n <= 0) return m->logits;
+    if (n == 1) return waste_model_step(m, tokens[0], pos0, NULL);
+    if (n > WASTE_CHUNK_MAX) n = WASTE_CHUNK_MAX;
+    {
+        const int cm = waste_model_ctx_max(m);
+        if (cm && (pos0 < 0 || pos0 > cm - n)) { m->ctx_full = 1; return NULL; }
+    }
+    if (qwen_chunk_alloc(m, n)) return NULL;
+    m->chunk_calls++;
+    m->chunk_tokens += n;
+
+    float *const hcx0 = m->hcx;
+    for (int t = 0; t < n; t++) {
+        float *st = m->qhx + (size_t)t * stride;
+        waste_embed_row(m, tokens[t], m->x);
+        for (int b = 0; b < hc; b++)
+            memcpy(st + (size_t)b * hid, m->x, (size_t)hid * sizeof(float));
+    }
+
+    const size_t istride = (size_t)(hc > 16 ? hc : 16);
+    for (int L = 0; L < c->n_layers && !m->read_error; L++) {
+        if (L == c->ple_layer) {
+            PROF_START(P_QPLE);
+            for (int t = 0; t < n; t++) {
+                m->hcx = m->qhx + (size_t)t * stride;
+                qwen_ple_inject(m, tokens[t]);
+            }
+            PROF_END(P_QPLE);
+        }
+        {
+        PROF_START(P_QHC);
+        qwen_hc_mix_chunk(m, n, m->qhx, stride, NULL, 0, NULL, 0,
+            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.hc_norm.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.attn_hyper_connection.block_inject_weight.weight", c->prefix, L)),
+            1, m->qx, (size_t)hid, m->qinj, istride);
+        PROF_END(P_QHC);
+        }
+
+        /* Forward, one token at a time: GDN carries its recurrence across
+         * the boundary and QSA publishes each token's keys before the next
+         * selects over them. GDN's projections batch around that loop. */
+        if (!c->qwen_full[L]) {
+            PROF_START(P_KDA);
+            qwen_gdn_chunk(m, L, m->qx, (size_t)hid, m->qblk, (size_t)hid, n);
+            PROF_END(P_KDA);
+        }
+        for (int t = 0; t < n && !m->read_error; t++) {
+            dump_pos0 = pos0 + t;
+            if (!c->qwen_full[L]) continue;   /* both are batched */
+        }
+        if (c->qwen_full[L]) {
+            PROF_START(P_MLA);
+            qwen_qsa_chunk(m, L, m->qx, (size_t)hid, m->qblk, (size_t)hid, pos0, n);
+            PROF_END(P_MLA);
+        }
+
+        {
+        PROF_START(P_QHC);
+        qwen_hc_mix_chunk(m, n, m->qhx, stride, m->qblk, (size_t)hid, m->qinj, istride,
+            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.hc_norm.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_down.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.input_mix_weight_up.weight", c->prefix, L)),
+            waste_find(m, tname("%smodel.layers.%d.mlp_hyper_connection.block_inject_weight.weight", c->prefix, L)),
+            1, m->qx, (size_t)hid, m->qinj, istride);
+        PROF_END(P_QHC);
+        }
+
+        /* The routed experts stay per token. Reading each of a group's
+         * distinct records once and applying it to the tokens that asked
+         * for it — moe_chunk's shape, and the obvious thing to do here —
+         * measured slower: it gives up the staged kernel that puts ten
+         * experts' rows across every thread at once, and the reads it saves
+         * are cache hits by the time a prefill is warm. LEARNED §88. */
+        for (int t = 0; t < n && !m->read_error; t++) {
+            dump_pos0 = pos0 + t;
+            PROF_START(P_ROUTE);
+            qwen_moe_layer(m, L, m->qx + (size_t)t * hid, m->qblk + (size_t)t * hid, NULL);
+            PROF_END(P_ROUTE);
+        }
+
+        {
+        PROF_START(P_QHC);
+        for (int t = 0; t < n; t++)
+            waste_qwen_hc_combine(m->qhx + (size_t)t * stride, m->qblk + (size_t)t * hid,
+                                  m->qinj + (size_t)t * istride, hc, hid,
+                                  m->qhx + (size_t)t * stride);
+        PROF_END(P_QHC);
+        }
+
+        /* One guess for the chunk, from the last token's streams: the next
+         * layer reads every token, but the records it will want are the
+         * same ones. */
+        if (lookahead_n && m->cache.io && m->cache.n_slots > 0) {
+            m->hcx = m->qhx + (size_t)(n - 1) * stride;
+            PROF_START(P_ROUTE);
+            PROF_START(P_QLAH);
+            int nxt[64];
+            const int nn = qwen_predict_next_moe(m, L, nxt, lookahead_n);
+            if (nn) waste_ecache_prefetch(&m->cache, L + 1, nxt, nn);
+            PROF_END(P_QLAH);
+            PROF_END(P_ROUTE);
+        }
+    }
+    m->hcx = hcx0;
+    if (m->read_error) return NULL;
+
+    memcpy(m->hcx, m->qhx + (size_t)(n - 1) * stride, stride * sizeof(float));
+    PROF_START(P_QHC);
+    qwen_hc_mix_t(m, m->hcx, NULL, NULL,
+        waste_find(m, tname("%smodel.hyper_connection_mixer.hc_norm.weight", c->prefix)),
+        waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_down.weight", c->prefix)),
+        waste_find(m, tname("%smodel.hyper_connection_mixer.input_mix_weight_up.weight", c->prefix)),
+        NULL, 0, m->x, NULL);
+    PROF_END(P_QHC);
+    PROF_START(P_HEAD);
+    matvec_t(m, m->logits, waste_find(m, tname("%slm_head.weight", c->prefix)), m->x,
+             c->vocab, hid);
+    PROF_END(P_HEAD);
+    return m->logits;
+}
+
+static const float *qwen_step(waste_model *m, int token, int pos, int *routed)
+{
+    dump_pos0 = pos;
+    const waste_config *c = &m->cfg;
+    const int hid = c->hidden, hc = c->hc_count;
+    {
+        const int cm = waste_model_ctx_max(m);
+        if (cm && (pos < 0 || pos >= cm)) { m->ctx_full = 1; return NULL; }
+    }
+    waste_embed_row(m, token, m->x);
+    for (int b = 0; b < hc; b++)
+        memcpy(m->hcx + (size_t)b * hid, m->x, (size_t)hid * sizeof(float));
+
+    for (int L = 0; L < c->n_layers; L++) {
+        if (m->read_error) break;
+        qwen_layer(m, L, token, pos, routed);
     }
     PROF_START(P_QHC);
     qwen_hc_mix_t(m, m->hcx, NULL, NULL,

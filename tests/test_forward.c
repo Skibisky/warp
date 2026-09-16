@@ -71,12 +71,19 @@ int main(int argc, char **argv)
            100.0 * m.cache.n_slots / (double)(m.cfg.n_experts * 26));
 
     const float *lg = NULL;
+    /* WASTE_CHUNK=1 prefills through waste_model_prefill at the engine's
+     * own chunk size; WASTE_CHUNK=N>1 asks for chunks of N, which is how
+     * the suite walks a prompt over sizes that do and do not divide the
+     * things a chunk has to get right — QSA's blocks of `compress`, the
+     * four-at-a-time attention, the last partial chunk. */
     const int chunked = getenv("WASTE_CHUNK") && atoi(getenv("WASTE_CHUNK")) != 0;
+    const int chunk_n = chunked ? atoi(getenv("WASTE_CHUNK")) : 0;
     t0 = now();
     if (chunked) {
         int done = 0;
         while (done < n) {
             int c = n - done;
+            if (chunk_n > 1 && c > chunk_n) c = chunk_n;
             if (c > waste_model_chunk_max(&m)) c = waste_model_chunk_max(&m);
             lg = waste_model_prefill(&m, ids + done, c, done);
             done += c;
@@ -103,6 +110,12 @@ int main(int argc, char **argv)
     for (int v = 1; v < m.cfg.vocab; v++) if (lg[v] > lg[best]) best = v;
     printf("prefill %d tok in %.2fs (%.2f tok/s); argmax %d, max %.4f\n",
            n, tp, n / tp, best, lg[best]);
+    {
+        long ccalls = 0, ctokens = 0, cgdn = 0, cqsa = 0;
+        waste_model_chunk_stats(&m, &ccalls, &ctokens, &cgdn, &cqsa);
+        printf("chunked %ld tok in %ld calls, gdn %ld, qsa %ld\n",
+               ctokens, ccalls, cgdn, cqsa);
+    }
     if (m.cfg.arch_qwen && m.has_qsa) {
         const int compress = m.cfg.idx_compress > 0 ? m.cfg.idx_compress : 4;
         for (int L = 0; L < m.cfg.n_layers; L++) {

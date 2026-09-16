@@ -418,6 +418,20 @@ typedef struct {
     int   *cused;                   /* chunk's distinct experts, ascending  */
     float *crw;
     int    chunk_cap;
+    /* What the batched prefill path actually did, so a test can tell the
+     * path apart from the per-token fallback it falls back to. Counted in
+     * tokens and in calls, never reset. */
+    long   chunk_calls, chunk_tokens, chunk_gdn, chunk_qsa;
+    float *qhx;                 /* chunk streams, [token][hc][hidden]      */
+    size_t qhx_cap;
+    /* Chunk scratch: the mix's normed streams, gates and low-rank rows,
+     * the per-token vector a sublayer runs on, its output, the inject
+     * weights, and the activation planes a batched projection reads. */
+    float *qnorm, *qgate, *qlo, *qx, *qblk, *qinj, *qnrm, *qab;
+    float *qmix, *qz, *qproj, *qattn;
+    int8_t *qxq;
+    float  *qxs;
+    int    qchunk_cap;
 
     float *blockres;                 /* AttnRes history: [nblocks][hidden]  */
     int    n_blockres;
@@ -531,6 +545,12 @@ const float *waste_model_prefill(waste_model *m, const int *tokens, int n,
  * the engine actually allocates. */
 #define WASTE_CHUNK_MAX 64
 int waste_model_chunk_max(const waste_model *m);
+/* Tokens (and calls) that went through the batched path rather than the
+ * one-token-per-call fallback. A prefill that quietly fell back is the
+ * failure tests/run.sh's chunk checks exist to catch, and comparing logits
+ * cannot see it: the fallback produces exactly the right answer. */
+void waste_model_chunk_stats(const waste_model *m, long *calls, long *tokens,
+                             long *gdn, long *qsa);
 
 /* Where the MoE router parks its scores inside m->att.
  *

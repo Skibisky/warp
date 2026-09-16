@@ -49,6 +49,20 @@ typedef struct {
     size_t rowbytes;
 } mvq4_arg;
 
+/* The same kernel over a chunk of tokens: one weight row against T
+ * activation vectors, so the weights are read once for the whole chunk
+ * instead of once per token. Each token keeps its own planes, its own
+ * scales and its own accumulation order, which is what makes a prefill's
+ * arithmetic the same as decode's. */
+typedef struct {
+    float *y; const uint8_t *W; const uint16_t *ws;
+    const int8_t *xq; const float *xs;
+    int in, ng, group;
+    size_t rowbytes;
+    int T;                       /* tokens in the chunk                    */
+    size_t ystride, xqstride, xsstride;
+} mvq4m_arg;
+
 typedef struct {
     float *lut; const float *booksT; const float *x;
     int cb_base, stages, entries, vec_dim;

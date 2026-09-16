@@ -6806,3 +6806,74 @@ mixed in, in one translation unit, where a compiler that transforms one
 and not the other is exactly what is being looked for. It is the same
 shape as §87's `test_qsa_pick`, and it was written after the fact rather
 than before, which is the part to do differently next time.
+## 94. Qwen's prefill, layer-major over a chunk (2026-09-16)
+
+A 2,801-token prompt took 232 seconds to read. Prefill was `waste_model_step`
+in a loop — Qwen was refused by the chunked path, which carries one residual
+per token and one dense attention per layer and has neither HyperConnection's
+four streams nor QSA's per-token pool. `qwen_prefill` carries both.
+
+**The shape.** State is `[token][4 streams][hidden]`, and a chunk is walked
+layer by layer rather than token by token. Both orders are legal for a causal
+model: layer L of token t reads layer L-1 of tokens up to t, and every token
+finishes layer L-1 before any starts L. What that buys is a layer's weights
+touched T times while they are warm, and projections that can batch.
+
+What cannot be reordered stays a loop, forward: GDN's recurrence carries S
+across tokens, its conv a ring per channel, QSA publishes each token's keys
+into the pool before the next token selects over them, and PLE reads the
+n-gram history. Every one of those is inside the token loop, in order.
+
+**Bit-identical, which is the whole constraint.** `matvec_t_multi` batches
+a projection across the chunk by putting the token loop *inside* the weight
+loads — `waste_mvq4_rows_i8mm_multi` unpacks a pair of weight rows once and
+multiplies it into eight tokens' planes — with each token's groups walked in
+the order the matvec walks them. Anything that is not the i8mm kernel loops
+`matvec_t`. The MoE sums its experts per token in route order either way.
+
+**What batching was worth**, 200 tokens of the same prompt, 16 GiB, eight
+threads, against 12.31 tok/s token-at-a-time:
+
+| | tok/s |
+|---|---:|
+| layer-major, every sublayer still per token | 14.43 |
+| + the HyperConnection mix's two projections | 14.21 |
+| + GDN's five | 15.45 |
+| + QSA's five | 15.75 |
+| + the routed experts, expert-major | 14.00 |
+| final: GDN, QSA, and the experts left per token | **16.06** |
+
+Two of those are the interesting ones. **The mix's projections are not worth
+batching**: 1.6 and 2.0 MB of weights that stay in cache across tokens
+anyway, against the cost of quantizing separately from the norm (§92 fuses
+the two for decode). **Expert-major routed experts lose**, which is the
+opposite of what `moe_chunk` does for K3: reading each of a group's distinct
+records once and applying it to the tokens that asked for it gives up the
+staged kernel that spreads ten experts' rows over every thread (§90), and
+the reads it saves are cache hits once a prefill is warm. Both were built,
+measured and taken out.
+
+The full prompt: **232.7 s → 166.6 s**, 12.04 → 16.82 tok/s. Profiled, the
+chunked prefill is 78% MoE — GDN 14.2 → 6.5 ms a token, HyperConnection
+9.7 → 4.2, QSA 4.8 → 2.5, the head 6.7 → 0.13 (one token's logits per
+chunk, not T), and the trunk matvec 78 → 136 GB/s overall, 213 in the
+8–32 MB band, which is weights read once for 64 tokens instead of 64 times.
+
+**The test came first, and earned it.** The suite's Qwen chunk check
+compared logits and passed — against a path that was falling back to one
+step per token and doing none of the work. It now walks 37 tokens at chunk
+sizes 1, 2, 3, 4, 5, 7, 8, 16, 37 and 64 — sizes that cut QSA's 4-token
+blocks open, leave a partial chunk, and put the whole prompt in one — and
+reads back the engine's own count of tokens the batched path took, and of
+those GDN and QSA batched, because each has a fallback of its own. A zero
+fails.
+
+It caught the one real bug: the copy of the previous mix's inject weights
+was parked past the end of the low-rank buffer, which is invisible below 33
+tokens a chunk and wrong above it. Logits at chunk sizes 2 through 32 were
+identical; 33 and up were not.
+
+Also checked: decode after a chunked prefill generates the same 16 tokens
+as decode after a sequential one, at chunk 64 and 7 — the state handed over
+is the GDN recurrence, the QSA pool, the n-gram history and the streams
+themselves.
