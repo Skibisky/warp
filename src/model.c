@@ -1900,7 +1900,17 @@ static int cfg_sane(const waste_config *c)
         if (c->idx_budget % c->idx_compress != 0) return 0;
         if (c->idx_kv_heads != 1) return 0;
         if (c->n_heads % c->qsa_n_kv != 0) return 0;
-        if (c->ngram_size < 1 || c->ngram_size > 8) return 0;
+        /* ngram_size 1 makes validate_qwen_tensors divide by
+         * (ngram_size - 1) * heads_per_ngram. arm64's sdiv quietly
+         * yields 0 and the container is refused for a wrong shape; x86's
+         * idiv raises #DE before the shape check is reached. The width
+         * only exists from the second n-gram element on (#69). */
+        if (c->ngram_size < 2 || c->ngram_size > 8) return 0;
+        /* linear_conv_kernel_dim sizes the GDN conv ring as (k - 1)
+         * elements; at 0 the ring is empty and gdn_conv_range walks a
+         * negative offset. The generic conv_k bound above allows 0, so
+         * Qwen states its own floor here (#69). */
+        if (c->conv_k < 1 || c->conv_k > 64) return 0;
         if (c->rotary_dim < 0 || c->rotary_dim > 256) return 0;
         if (c->rotary_dim / 2 > WASTE_MAX_ROPE_HALF) return 0;
         if ((int64_t)c->hc_count * c->hidden > INT_MAX) return 0;
@@ -1917,6 +1927,13 @@ static int cfg_sane(const waste_config *c)
             for (int h = 0; h < WASTE_QWEN_PLE_HEADS; h++)
                 if (c->ple_sz[h] <= 0) return 0;
         }
+        /* The shared expert batches its gate and up projections into m->ff,
+         * which is sized from the routed and dense widths only
+         * (model.c:3272), so a container whose shared width exceeds both
+         * writes past the buffer. Flash-Next fits exactly (640 = 640),
+         * which is why nothing noticed (#69). */
+        if (c->shared_inter > (c->dense_inter > c->moe_inter
+                               ? c->dense_inter : c->moe_inter)) return 0;
     }
     if (c->n_experts && c->moe_inter < 1) return 0;
     if ((!c->n_experts || c->first_dense) && c->dense_inter < 1) return 0;
