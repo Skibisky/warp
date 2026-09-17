@@ -1748,6 +1748,54 @@ else
         no "Qwen chunked prefill disagrees with sequential decode"
     fi
 
+    # The chunk-native routed path computes pairs out of order but must
+    # reduce route slots in their original order. Use the same 37 tokens as
+    # the chunk test above: three tokens made 4/8/16 the same tile and never
+    # crossed a tile boundary. Sixteen generated tokens also check the state
+    # the tiled fill hands to decode. Exercise the int8 table too: this path
+    # used to be excluded from experts_staged entirely.
+    ./test_forward "$QWENC" "$QCIDS" "$TMP/qwen_tile_seq.bin" 16 >/dev/null 2>&1
+    qct_bad=""
+    for qct in 4 8 16; do
+        qct_out=$(WASTE_CACHE_MB=512 WASTE_CHUNK=1 WASTE_CHUNK_MOE_TILE=$qct \
+            ./test_forward "$QWENC" "$QCIDS" "$TMP/qwen_tile_$qct.bin" 16 2>&1)
+        qct_moe=$(printf '%s' "$qct_out" | sed -n 's/.*moe \([0-9]*\).*/\1/p')
+        if ! cmp -s "$TMP/qwen_tile_seq.bin" "$TMP/qwen_tile_$qct.bin"; then
+            qct_bad="$qct_bad float-$qct"
+        elif [ "${qct_moe:-0}" -lt 36 ]; then
+            qct_bad="$qct_bad float-$qct(fell back)"
+        fi
+        qct_out=$(WASTE_CACHE_MB=512 WASTE_VQ8=1 WASTE_CHUNK=1 \
+            WASTE_CHUNK_MOE_TILE=$qct ./test_forward "$QWENC" "$QCIDS" \
+            "$TMP/qwen_vq8_tile_$qct.bin" 16 2>&1)
+        qct_moe=$(printf '%s' "$qct_out" | sed -n 's/.*moe \([0-9]*\).*/\1/p')
+        if [ "${qct_moe:-0}" -lt 36 ]; then
+            qct_bad="$qct_bad vq8-$qct(fell back)"
+        fi
+        if [ "$qct" = 4 ]; then
+            cp "$TMP/qwen_vq8_tile_4.bin" "$TMP/qwen_vq8_ref.bin"
+        elif ! cmp -s "$TMP/qwen_vq8_ref.bin" "$TMP/qwen_vq8_tile_$qct.bin"; then
+            qct_bad="$qct_bad vq8-$qct"
+        fi
+    done
+    if [ -n "$qct_bad" ]; then
+        no "Qwen chunk-native VQ8 tiles disagree at:$qct_bad"
+    else
+        ok "Qwen chunk-native tiles cross boundaries, hand off to decode, and agree"
+    fi
+
+    # No cache cannot pin a tile. That is a supported fallback, and it must
+    # be the exact old path rather than a half-reduced chunk.
+    qct_fb=$(WASTE_CACHE_MB=0 WASTE_CHUNK=1 WASTE_CHUNK_MOE_TILE=16 \
+        ./test_forward "$QWENC" "$QCIDS" "$TMP/qwen_tile_fallback.bin" 16 2>&1)
+    qct_fb_moe=$(printf '%s' "$qct_fb" | sed -n 's/.*moe \([0-9]*\).*/\1/p')
+    if cmp -s "$TMP/qwen_tile_seq.bin" "$TMP/qwen_tile_fallback.bin" &&
+       [ "${qct_fb_moe:-1}" -eq 0 ]; then
+        ok "Qwen chunk-native MoE falls back whole and unchanged when it cannot pin"
+    else
+        no "Qwen chunk-native MoE fallback is partial or numerically different"
+    fi
+
     # Which way a Qwen layer's routed experts are scheduled — the row
     # split, a batch of four, or every one of them in a single dispatch,
     # which is what the default does once the cache holds them — is not a

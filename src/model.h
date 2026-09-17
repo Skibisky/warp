@@ -299,6 +299,14 @@ typedef struct {
     float *xga, *xub, *xacc, *xlut, *xqs;
     int8_t *xlut8;
     size_t xlut_sz, xnsc;            /* floats per down LUT, scales per it */
+    /* Chunk-native staged MoE scratch. Unlike x*, this is indexed by
+     * (token, route slot), and is grown only as far as the selected small
+     * token tile. Keeping every pair's result is what lets the reduction
+     * remain in route order after the row tasks complete out of order. */
+    float *cxga, *cxub, *cxacc, *cxlut, *cxqs, *cxgu, *cxgus;
+    int8_t *cxlut8, *cxgu8;
+    const uint8_t **cxrec;
+    int cxpair_cap, cxtoken_cap;
     /* 1 << fmt for every trunk format the language model actually uses,
      * recorded at load because the tensors left on disk never reach the
      * branch that fills in t->bits. */
@@ -421,7 +429,7 @@ typedef struct {
     /* What the batched prefill path actually did, so a test can tell the
      * path apart from the per-token fallback it falls back to. Counted in
      * tokens and in calls, never reset. */
-    long   chunk_calls, chunk_tokens, chunk_gdn, chunk_qsa;
+    long   chunk_calls, chunk_tokens, chunk_gdn, chunk_moe, chunk_qsa;
     float *qhx;                 /* chunk streams, [token][hc][hidden]      */
     size_t qhx_cap;
     /* Chunk scratch: the mix's normed streams, gates and low-rank rows,
@@ -517,6 +525,7 @@ void        waste_model_set_device_min_kb(long kb);
 void        waste_model_set_metal_moe(int on);
 void        waste_model_set_vq8(int on);
 void        waste_model_set_wide(int mask);
+void        waste_model_set_chunk_moe_tile(int n);
 int         waste_model_fast_threads(void);
 int         waste_pool_threads_public(void);
 int         waste_model_get_lookahead(void);
@@ -550,7 +559,7 @@ int waste_model_chunk_max(const waste_model *m);
  * failure tests/run.sh's chunk checks exist to catch, and comparing logits
  * cannot see it: the fallback produces exactly the right answer. */
 void waste_model_chunk_stats(const waste_model *m, long *calls, long *tokens,
-                             long *gdn, long *qsa);
+                             long *gdn, long *moe, long *qsa);
 
 /* Where the MoE router parks its scores inside m->att.
  *

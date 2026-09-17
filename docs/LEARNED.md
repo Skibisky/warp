@@ -6806,6 +6806,7 @@ mixed in, in one translation unit, where a compiler that transforms one
 and not the other is exactly what is being looked for. It is the same
 shape as §87's `test_qsa_pick`, and it was written after the fact rather
 than before, which is the part to do differently next time.
+
 ## 94. Qwen's prefill, layer-major over a chunk (2026-09-16)
 
 A 2,801-token prompt took 232 seconds to read. Prefill was `waste_model_step`
@@ -6877,3 +6878,71 @@ Also checked: decode after a chunked prefill generates the same 16 tokens
 as decode after a sequential one, at chunk 64 and 7 — the state handed over
 is the GDN recurrence, the QSA pool, the n-gram history and the streams
 themselves.
+
+## 95. Stage routed experts across tokens, but keep the reduction per token (2026-09-18)
+
+Qwen's first real chunked prefill still called `qwen_moe_layer` once per
+token. That preserved §90's balanced row staging, but paid its three pool
+dispatches once per token: gate/up rows, activation plus the down LUT, and
+down rows. Reordering the whole chunk expert-first had already lost (§94);
+the useful unit is a small token tile.
+
+`WASTE_CHUNK_MOE_TILE=4|8|16` routes the chunk first and stages tasks as
+`(token, route slot, row tile)`. Gate/up LUTs are built once per token, the
+down LUT has one bounded scratch slice per token/expert pair, and completed
+experts are reduced in the router's original slot order. That last part is
+the numerical contract: computation may finish in any order, but the ten
+weighted expert outputs are added in exactly the order decode uses.
+
+A 16-token tile can name more than the read-ahead window's 64 experts. Hints
+therefore remain in 64-record windows while explicit holds span 256 records.
+The first implementation left the hold limit at 64; tile 16 silently fell
+back after the first window and its apparently valid measurement was of the
+old path. The engine now counts tokens whose tiled MoE actually ran, and the
+suite rejects that kind of successful fallback.
+
+**Correctness.** A 37-token fixture crosses every 4/8/16 tile boundary and
+then decodes 16 tokens. All three float tiles are byte-identical to sequential
+execution. The no-cache arm proves a tile that cannot pin its records falls
+back whole rather than leaving a partial reduction. On the real container,
+256 prompt tokens plus 64 teacher-forced positions give KL 0, relative L2 0,
+100% top-10 overlap and 64/64 argmax agreement for every float tile. The full
+suite is 93 passed, 0 failed.
+
+**Short, cache-constrained sweep.** Qwen3.8-Flash-Next, the first 256 tokens
+of `docs/QWEN.md`, 64 decoded tokens, 4 GiB expert cache, 12 threads of which
+eight are fast, three interleaved repeats after one load:
+
+| tile | mean fill | mean fill + decode | expert read, representative |
+|---:|---:|---:|---:|
+| old | 20.85 s | 31.43 s | 69.4 GB |
+| 4 | 20.09 s | 29.80 s | 67.9 GB |
+| **8** | **18.97 s** | **29.12 s** | 67.0 GB |
+| 16 | 19.23 s | 29.41 s | **65.7 GB** |
+
+Tile 8 wins that mean because tile 16's first decode lands on a colder cache.
+The other two tile-16 repeats are the fastest totals in the table. A short
+sweep does not choose the default.
+
+**The real prompt.** The exact 2,801 tokens used throughout the Qwen work,
+16 GiB expert cache, same thread split, adjacent arms in one process:
+
+| path | fill | decode | expert read |
+|---|---:|---:|---:|
+| old chunked MoE | 176.09 s | 10.97 tok/s | 163.0 GB |
+| float tile 16 | **152.46 s** | **11.53 tok/s** | **152.7 GB** |
+
+That is 13.4% less fill latency and 10.3 GB fewer reads. A second adjacent
+comparison answers the tile-size question directly: tile 8 took 159.77 s
+and read 153.3 GB; tile 16 took **153.81 s** and read 151.3 GB. Tile 16 is
+the long-context choice.
+
+**The int8 table does not ship.** This path also made `WASTE_VQ8` reachable
+for Qwen prefill, and the short timing looked attractive. The quality gate
+did not: over 512 real prompt tokens and 128 teacher-forced decode positions,
+float against VQ8 measured KL **2.98e-2**, relative L2 **0.118**, 91.2%
+top-10 overlap and only **115/128 argmax agreement**. Decode also fell from
+6.42 to 5.11 tok/s because Qwen's decode path gives up the balanced staged
+kernel under VQ8. The earlier 160.22-second result mixed tiling and VQ8 and
+is not evidence for either alone. Float tile 16 is the result; VQ8 remains
+off.

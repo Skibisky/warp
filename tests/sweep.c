@@ -61,14 +61,14 @@ static double now(void)
 }
 
 #define MAX_ARMS 16
-#define MAX_IDS 512
+#define MAX_IDS 4096
 
 int main(int argc, char **argv)
 {
     if (argc < 5) {
         fprintf(stderr,
                 "usage: %s CONTAINER ids,.. n_gen KEY=v1,v2,.. [repeat]\n"
-                "  KEY is lookahead, iodepth, cache (MB), topk, trunk or devkb\n", argv[0]);
+                "  KEY is lookahead, iodepth, cache (MB), topk, trunk, devkb, or chunktile\n", argv[0]);
         return 2;
     }
     int ids[MAX_IDS], n = 0;
@@ -112,7 +112,10 @@ int main(int argc, char **argv)
      * cores instead of the whole pool. 1 VQ apply, 2 trunk matvec,
      * 4 LUT build, added together. */
     const int is_wide = !strcmp(key, "wide");
-    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev && !is_gmoe && !is_vq8 && !is_wide) {
+    /* chunktile=0,4,8,16: historical expert-first prefill, or the
+     * chunk-native staged routed-expert tile. */
+    const int is_ctile = !strcmp(key, "chunktile");
+    if (!is_look && !is_depth && !is_cache && !is_topk && !is_sdot4 && !is_dev && !is_gmoe && !is_vq8 && !is_wide && !is_ctile) {
         fprintf(stderr, "unknown key %s\n", key);
         return 2;
     }
@@ -169,8 +172,9 @@ int main(int argc, char **argv)
         ref_routes = (int *)malloc((size_t)waste_route_cap_n * sizeof(int));
         if (!waste_route_cap || !ref_routes) { fprintf(stderr, "no room for routes\n"); return 1; }
     }
-    printf("%8s %6s %7s %9s %9s %9s%s\n", key, "rep", "slots", "tok/s", "hit",
-           "GB read", prof ? "   tmv GB/s   kda s  luta s" : "");
+    printf("%8s %6s %7s %9s %9s %9s %9s%s\n", key, "rep", "slots",
+           "fill s", "tok/s", "hit", "GB read",
+           prof ? "   tmv GB/s   kda s  luta s" : "");
     for (int r = 0; r < repeat; r++) {
         for (int a = 0; a < n_arms; a++) {
             if (is_topk) {
@@ -182,6 +186,8 @@ int main(int argc, char **argv)
                 m.cfg.top_k = arm[a];
             } else if (is_wide) {
                 waste_model_set_wide(arm[a]);
+            } else if (is_ctile) {
+                waste_model_set_chunk_moe_tile(arm[a]);
             } else if (is_vq8) {
                 waste_model_set_vq8(arm[a]);
             } else if (is_gmoe) {
@@ -203,7 +209,15 @@ int main(int argc, char **argv)
             waste_ecache_clear(&m.cache);
 
             const float *lg = NULL;
-            for (int i = 0; i < n; i++) lg = waste_model_step(&m, ids[i], i, NULL);
+            const double fill0 = now();
+            for (int i = 0; i < n; ) {
+                int k = n - i;
+                if (k > waste_model_chunk_max(&m)) k = waste_model_chunk_max(&m);
+                lg = k > 1 ? waste_model_prefill(&m, ids + i, k, i)
+                           : waste_model_step(&m, ids[i], i, NULL);
+                i += k;
+            }
+            const double fill_dt = now() - fill0;
             if (!lg) { fprintf(stderr, "prompt failed\n"); return 1; }
 
             int cur = 0;
@@ -278,8 +292,8 @@ int main(int argc, char **argv)
             }
             const double dt = now() - s - kl_time;
             const unsigned long long h = m.cache.hits, mi = m.cache.misses;
-            printf("%8d %6d %7d %8.3f %8.1f%% %8.1f", arm[a], r + 1,
-                   m.cache.n_slots, n_gen / dt,
+            printf("%8d %6d %7d %8.3f %8.3f %8.1f%% %8.1f", arm[a], r + 1,
+                   m.cache.n_slots, fill_dt, n_gen / dt,
                    100.0 * (double)h / (double)(h + mi ? h + mi : 1),
                    (double)m.cache.bytes_read / 1073741824.0);
             /* Two different questions, and only the second one matters.

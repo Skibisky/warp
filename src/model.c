@@ -234,6 +234,9 @@ static int p6_chunk = 4;               /* WASTE_P6_CHUNK, see vq_apply    */
 static int xpar_on = -1;
 static int metal_moe = 0;              /* WASTE_METAL_MOE, see moe_layer    */
 static int vq8_on = 0;                 /* WASTE_VQ8: int8 VQ3R table        */
+/* Prefill routed-expert tile. 0 keeps the historical expert-first path;
+ * 4/8/16 select the chunk-native staged experiment. */
+static int chunk_moe_tile = 0;          /* WASTE_CHUNK_MOE_TILE              */
 /* Which kernels are cut for the performance cores rather than the whole
  * pool. A bitmask because LEARNED §47's finding is per kernel, not per
  * machine: bit 0 the VQ apply, bit 1 the quantized trunk matvec, bit 2 the
@@ -366,6 +369,10 @@ static void model_opts_init(void)
       if (wide_mask < 0) wide_mask = 0; }
     { const char *e2 = getenv("WASTE_VQ8");
       vq8_on = e2 && *e2 != '0'; }
+    { const char *e2 = getenv("WASTE_CHUNK_MOE_TILE");
+      chunk_moe_tile = e2 ? atoi(e2) : 0;
+      if (chunk_moe_tile < 0) chunk_moe_tile = 0;
+      if (chunk_moe_tile > 16) chunk_moe_tile = 16; }
     { const char *e2 = getenv("WASTE_METAL_MOE");
       metal_moe = e2 && *e2 != '0'; }
     { const char *e2 = getenv("WASTE_XPAR");
@@ -3461,6 +3468,9 @@ void waste_model_free(waste_model *m)
     free(m->lut8); free(m->lut8_scale);
     free(m->xga); free(m->xub); free(m->xacc);
     waste_dio_free(m->xlut); free(m->xlut8); free(m->xqs);
+    free(m->cxga); free(m->cxub); free(m->cxacc); free(m->cxlut);
+    free(m->cxlut8); free(m->cxqs); free(m->cxgu); free(m->cxgu8);
+    free(m->cxgus); free(m->cxrec);
     free(m->xq); free(m->xs); waste_dio_free(m->miss_buf);
     free(m->blockres); free(m->prefix_sum); free(m->ares);
     free(m->cx); free(m->cnorm); free(m->cresid); free(m->cq); free(m->ckv);
@@ -6303,6 +6313,10 @@ void waste_model_set_metal_moe(int on) { metal_moe = on; }
 void waste_model_set_vq8(int on) { vq8_on = on; }
 
 void waste_model_set_wide(int mask) { wide_mask = mask < 0 ? 0 : mask; }
+void waste_model_set_chunk_moe_tile(int n)
+{
+    chunk_moe_tile = n < 0 ? 0 : n > 16 ? 16 : n;
+}
 int  waste_model_fast_threads(void) { return waste_pool_fast(); }
 int  waste_pool_threads_public(void) { return waste_pool_threads(); }
 
@@ -6824,11 +6838,12 @@ int waste_model_state_load(waste_model *m, const char *path, int *pos)
 int waste_model_chunk_max(const waste_model *m) { (void)m; return WASTE_CHUNK_MAX; }
 
 void waste_model_chunk_stats(const waste_model *m, long *calls, long *tokens,
-                             long *gdn, long *qsa)
+                             long *gdn, long *moe, long *qsa)
 {
     if (calls) *calls = m->chunk_calls;
     if (tokens) *tokens = m->chunk_tokens;
     if (gdn) *gdn = m->chunk_gdn;
+    if (moe) *moe = m->chunk_moe;
     if (qsa) *qsa = m->chunk_qsa;
 }
 
@@ -7043,7 +7058,7 @@ static int prefill_alloc(waste_model *m, int T)
         const size_t lut_sz = (size_t)(nmax / m->vec_dim + 1) *
                               (size_t)m->stages * (size_t)m->cb_entries;
         m->cq = (float *)calloc((size_t)(2 * T + 1) * lut_sz + 64, sizeof(float));
-        if (m->index_bits == 6) {
+        if (m->index_bits == 6 || m->lut8) {
             const size_t nsc = lut_sz / ((size_t)m->stages * m->cb_entries)
                                / WASTE_VQ_LUT_BLK + 2;
             m->cq8 = (int8_t *)calloc((size_t)(2 * T + 1) * lut_sz + 64, 1);
@@ -7079,6 +7094,240 @@ static int prefill_alloc(waste_model *m, int T)
     return (m->cx && m->cnorm && m->cresid && m->cq && m->ckv && m->clat &&
             m->cff && m->cexp && m->cblockres && m->cprefix && m->croute &&
             m->crw && m->cused) ? 0 : -1;
+}
+
+/* Grow the pair-indexed scratch used by chunk-native staging. Allocation is
+ * deliberately separate from prefill_alloc: an in-process sweep can enable
+ * the experiment after an earlier baseline arm has already allocated the
+ * ordinary chunk buffers. */
+static int chunk_pair_alloc(waste_model *m, int pairs, int tokens)
+{
+    if (m->cxpair_cap >= pairs && m->cxtoken_cap >= tokens) return 0;
+    const waste_config *c = &m->cfg;
+    const int lat = c->latent_dim ? c->latent_dim : c->hidden;
+    const size_t np = (size_t)pairs;
+    float *ga = (float *)malloc(np * c->moe_inter * sizeof(float));
+    float *ub = (float *)malloc(np * c->moe_inter * sizeof(float));
+    float *ac = (float *)malloc(np * lat * sizeof(float));
+    float *lu = (float *)malloc(np * m->xlut_sz * sizeof(float));
+    float *gu = (float *)malloc((size_t)2 * tokens * m->xlut_sz * sizeof(float));
+    const uint8_t **re = (const uint8_t **)malloc(np * sizeof(*re));
+    int8_t *q = NULL;
+    int8_t *gq = NULL;
+    float *qs = NULL;
+    float *gs = NULL;
+    const int needq = m->index_bits == 6 || m->lut8 != NULL;
+    if (needq) {
+        q = (int8_t *)malloc(np * m->xlut_sz);
+        qs = (float *)malloc(np * m->xnsc * sizeof(float));
+        gq = (int8_t *)malloc((size_t)2 * tokens * m->xlut_sz);
+        gs = (float *)malloc((size_t)2 * tokens * m->xnsc * sizeof(float));
+    }
+    if (!ga || !ub || !ac || !lu || !gu || !re ||
+        (needq && (!q || !qs || !gq || !gs))) {
+        free(ga); free(ub); free(ac); free(lu); free(gu); free(re);
+        free(q); free(qs); free(gq); free(gs);
+        return -1;
+    }
+    free(m->cxga); free(m->cxub); free(m->cxacc); free(m->cxlut);
+    free(m->cxrec); free(m->cxlut8); free(m->cxqs);
+    free(m->cxgu); free(m->cxgu8); free(m->cxgus);
+    m->cxga = ga; m->cxub = ub; m->cxacc = ac; m->cxlut = lu;
+    m->cxrec = re; m->cxlut8 = q; m->cxqs = qs;
+    m->cxgu = gu; m->cxgu8 = gq; m->cxgus = gs;
+    m->cxpair_cap = pairs;
+    m->cxtoken_cap = tokens;
+    return 0;
+}
+
+typedef struct {
+    waste_model *m;
+    const float *xin;
+    float *lut;
+    int8_t *q;
+    float *qs;
+    int nT, lat, lut_sz, nsc, cb0;
+} chunk_gu_arg;
+
+/* One dispatch for every gate/up table in the routed chunk. Each task owns
+ * a complete table, so the pool is not recursively entered by lutb_range. */
+static void chunk_gate_up_luts(int b, int e, void *p)
+{
+    const chunk_gu_arg *a = (const chunk_gu_arg *)p;
+    waste_model *m = a->m;
+    for (int k = b; k < e; k++) {
+        const int t = k / 2, which = k & 1;
+        float *lut = a->lut + (size_t)k * a->lut_sz;
+        lutb_arg la = { lut, m->codebooksT, a->xin + (size_t)t * a->lat,
+                        a->cb0 + which * m->stages, m->stages,
+                        m->cb_entries, m->vec_dim };
+        waste_k.lutb_range(0, a->lat / m->vec_dim, &la);
+        if (a->q)
+            vq_quant_lut(lut, a->lat / m->vec_dim, m->stages, m->cb_entries,
+                         a->q + (size_t)k * a->lut_sz,
+                         a->qs + (size_t)k * a->nsc);
+    }
+}
+
+typedef struct {
+    waste_model *m;
+    const float *lut_gu;
+    const int8_t *q_gu;
+    const float *qs_gu;
+    int t0, K, pairs, inter, lat, lut_sz, nsc, n_gu, n_dn;
+} chunk_stage_arg;
+
+/* Tasks are (token, route slot, matrix, row tile). This is the same equal
+ * row division as experts_staged, extended across a small token tile. */
+static void chunk_stage_gate_up(int b, int e, void *p)
+{
+    const chunk_stage_arg *a = (const chunk_stage_arg *)p;
+    waste_model *m = a->m;
+    const int per = 2 * a->n_gu;
+    for (int k = b; k < e; k++) {
+        const int pair = k / per, mat = (k % per) / a->n_gu;
+        const int r0 = ((k % per) % a->n_gu) * XS_ROWS;
+        const int r1 = r0 + XS_ROWS < a->inter ? r0 + XS_ROWS : a->inter;
+        const int token = pair / a->K;
+        const uint8_t *rec = m->cxrec[pair];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        float *y = (mat ? m->cxub : m->cxga) + (size_t)pair * a->inter;
+        const float *lut = a->lut_gu + (size_t)(2 * token + mat) * a->lut_sz;
+        if (m->index_bits == 6 || (vq8_on && a->q_gu && waste_k.vq_rows_e)) {
+            vqp_arg va = { y, rec + (mat ? h->up_off : h->gate_off),
+                           sc + mat * a->inter,
+                           a->q_gu + (size_t)(2 * token + mat) * a->lut_sz,
+                           a->qs_gu + (size_t)(2 * token + mat) * a->nsc,
+                           a->lat / m->vec_dim };
+            (m->index_bits == 6 ? waste_k.vq_rows_p6 : waste_k.vq_rows_e)(r0, r1, &va);
+        } else {
+            vq_arg va = { y, rec + (mat ? h->up_off : h->gate_off),
+                          sc + mat * a->inter, lut, a->lat / m->vec_dim,
+                          m->stages, m->cb_entries };
+            vq_rows(r0, r1, &va);
+        }
+    }
+}
+
+static void chunk_stage_down_lut(int b, int e, void *p)
+{
+    const chunk_stage_arg *a = (const chunk_stage_arg *)p;
+    waste_model *m = a->m;
+    for (int pair = b; pair < e; pair++) {
+        float *ga = m->cxga + (size_t)pair * a->inter;
+        waste_act_pair_range(&m->cfg, ga, m->cxub + (size_t)pair * a->inter,
+                             a->inter);
+        const waste_expert_hdr *h = (const waste_expert_hdr *)m->cxrec[pair];
+        float *lut = m->cxlut + (size_t)pair * m->xlut_sz;
+        lutb_arg la = { lut, m->codebooksT, ga,
+                        h->codebook_id + 2 * m->stages, m->stages,
+                        m->cb_entries, m->vec_dim };
+        waste_k.lutb_range(0, a->inter / m->vec_dim, &la);
+        if (m->cxlut8)
+            vq_quant_lut(lut, a->inter / m->vec_dim, m->stages,
+                         m->cb_entries,
+                         m->cxlut8 + (size_t)pair * m->xlut_sz,
+                         m->cxqs + (size_t)pair * m->xnsc);
+    }
+}
+
+static void chunk_stage_down(int b, int e, void *p)
+{
+    const chunk_stage_arg *a = (const chunk_stage_arg *)p;
+    waste_model *m = a->m;
+    for (int k = b; k < e; k++) {
+        const int pair = k / a->n_dn;
+        const int r0 = (k % a->n_dn) * XS_ROWS;
+        const int r1 = r0 + XS_ROWS < a->lat ? r0 + XS_ROWS : a->lat;
+        const uint8_t *rec = m->cxrec[pair];
+        const waste_expert_hdr *h = (const waste_expert_hdr *)rec;
+        const uint16_t *sc = (const uint16_t *)(rec + h->chan_corr_off);
+        float *y = m->cxacc + (size_t)pair * a->lat;
+        const float *lut = m->cxlut + (size_t)pair * m->xlut_sz;
+        if (m->index_bits == 6 || (vq8_on && m->cxlut8 && waste_k.vq_rows_e)) {
+            vqp_arg va = { y, rec + h->down_off, sc + 2 * a->inter,
+                           m->cxlut8 + (size_t)pair * m->xlut_sz,
+                           m->cxqs + (size_t)pair * m->xnsc,
+                           a->inter / m->vec_dim };
+            (m->index_bits == 6 ? waste_k.vq_rows_p6 : waste_k.vq_rows_e)(r0, r1, &va);
+        } else {
+            vq_arg va = { y, rec + h->down_off, sc + 2 * a->inter, lut,
+                          a->inter / m->vec_dim, m->stages, m->cb_entries };
+            vq_rows(r0, r1, &va);
+        }
+    }
+}
+
+/* Returns one on success. A zero asks moe_chunk to use its historical path;
+ * in particular, a tile that cannot be pinned never turns a memory-pressure
+ * experiment into a failed prompt. */
+static int chunk_experts_staged(waste_model *m, int L, const float *xin,
+                                float *ysum, int nT, int K, int inter, int lat,
+                                const int *route, const float *rw)
+{
+    const int tile = chunk_moe_tile < nT ? chunk_moe_tile : nT;
+    if (tile <= 0 || chunk_pair_alloc(m, tile * K, tile)) return 0;
+    const int lut_sz = (int)m->xlut_sz, nsc = (int)m->xnsc;
+    for (int t0 = 0; t0 < nT; t0 += tile) {
+        const int nt = nT - t0 < tile ? nT - t0 : tile;
+        const int pairs = nt * K;
+        int ids[16 * 64], nids = 0;
+        for (int p = 0; p < pairs; p++) {
+            const int id = route[(size_t)t0 * K + p];
+            int seen = 0;
+            for (int u = 0; u < nids; u++) if (ids[u] == id) { seen = 1; break; }
+            if (!seen) ids[nids++] = id;
+        }
+        if (nids > m->cache.n_slots) return 0;
+        int ok = 1;
+        for (int w = 0; w < nids && ok; w += WASTE_PF_MAX) {
+            const int wn = nids - w < WASTE_PF_MAX ? nids - w : WASTE_PF_MAX;
+            waste_ecache_hint(&m->cache, L, ids + w, wn);
+            for (int u = w; u < w + wn; u++) {
+                const uint8_t *rec = waste_ecache_hold(&m->cache, L, ids[u],
+                                                        bank_fetch, m);
+                if (!rec) { ok = 0; break; }
+                for (int p = 0; p < pairs; p++)
+                    if (route[(size_t)t0 * K + p] == ids[u]) m->cxrec[p] = rec;
+            }
+        }
+        if (!ok) { waste_ecache_release(&m->cache); return 0; }
+
+        {
+            const waste_expert_hdr *h = (const waste_expert_hdr *)m->cxrec[0];
+            chunk_gu_arg ga = { m, xin + (size_t)t0 * lat,
+                                m->cxgu, m->cxgu8, m->cxgus, nt, lat,
+                                lut_sz, nsc, h->codebook_id };
+            waste_parallel_for_each(2 * nt, chunk_gate_up_luts, &ga,
+                                    g_pool.nthreads);
+        }
+        chunk_stage_arg a = { m, m->cxgu, m->cxgu8, m->cxgus, t0, K, pairs,
+                              inter, lat, lut_sz, nsc,
+                              (inter + XS_ROWS - 1) / XS_ROWS,
+                              (lat + XS_ROWS - 1) / XS_ROWS };
+        waste_parallel_for_each(pairs * 2 * a.n_gu, chunk_stage_gate_up, &a,
+                                g_pool.nthreads);
+        waste_parallel_for_each(pairs, chunk_stage_down_lut, &a,
+                                g_pool.nthreads);
+        waste_parallel_for_each(pairs * a.n_dn, chunk_stage_down, &a,
+                                g_pool.nthreads);
+
+        /* Computation order is free; reduction order is not. Preserve the
+         * original router order exactly, including the same fused multiply
+         * add expression used by the single-token path. */
+        for (int t = 0; t < nt; t++) {
+            float *dst = ysum + (size_t)(t0 + t) * lat;
+            for (int j = 0; j < K; j++) {
+                const int p = t * K + j;
+                const float wj = rw[(size_t)(t0 + t) * K + j];
+                const float *acc = m->cxacc + (size_t)p * lat;
+                for (int i = 0; i < lat; i++) dst[i] += wj * acc[i];
+            }
+        }
+        waste_ecache_release(&m->cache);
+    }
+    return 1;
 }
 
 /* MoE over a whole chunk.
@@ -7172,6 +7421,14 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
 
     float *ga = m->cff, *ub = ga + inter, *acc = m->cff + 2 * inter;
 
+    if (chunk_moe_tile) {
+        if (chunk_experts_staged(m, L, xin, ysum, nT, K, inter, lat, route, rw))
+            goto chunk_experts_done;
+        /* A later tile can fail to pin after earlier tiles have already
+         * reduced. The historical fallback recomputes the whole chunk. */
+        memset(ysum, 0, (size_t)nT * lat * sizeof(float));
+    }
+
     /* Collect the distinct experts first, so their reads can be handed to
      * the cache ahead of the arithmetic. The order is the same ascending
      * one the loop below consumes, which is what lets the read-ahead be a
@@ -7240,6 +7497,8 @@ static void moe_chunk(waste_model *m, int L, const float *in, float *out, int nT
     }
     }
 chunk_lost:
+
+chunk_experts_done:
 
     if (c->latent_dim) {
         if (c->latent_norm) {
@@ -8462,6 +8721,95 @@ qwen_moe_shared:
     }
 }
 
+/* Qwen routed experts over a small token tile. Routing and the shared
+ * projections see the whole chunk; chunk_experts_staged then cuts the
+ * routed work as (token, route slot, row tile) tasks. Returns zero when its
+ * bounded scratch or cache pins do not fit, and the caller uses the exact
+ * per-token path above. */
+static int qwen_moe_chunk(waste_model *m, int L, const float *in, float *out,
+                          int nT)
+{
+    const waste_config *c = &m->cfg;
+    const int E = c->n_experts, K = c->top_k, hid = c->hidden;
+    const int inter = c->moe_inter;
+    const int shared = c->shared_inter ? c->shared_inter : inter;
+    const size_t ps = (size_t)E + 2u * (size_t)shared + 1u;
+    const size_t qd = (size_t)c->n_heads * (c->qsa_head_dim > 0 ? c->qsa_head_dim : 1);
+    const size_t kvd = (size_t)(c->qsa_n_kv > 0 ? c->qsa_n_kv : 1) *
+                       (c->qsa_head_dim > 0 ? c->qsa_head_dim : 1);
+    const size_t idxd = (size_t)(c->idx_n_heads + c->idx_kv_heads) *
+                        (c->idx_head_dim > 0 ? c->idx_head_dim : 1);
+    const size_t qcap = 2 * qd + 2 * kvd + idxd;
+    if (!chunk_moe_tile || !m->qproj || !m->qattn || ps > qcap || qd < (size_t)hid)
+        return 0;
+
+    float *p = m->qproj;
+    PROF_START(P_QRTR);
+    matvec_t_multi(m, p, ps,
+        waste_find(m, tname("%smodel.layers.%d.mlp.gate.weight", c->prefix, L)),
+        in, (size_t)hid, E, hid, nT);
+    matvec_t_multi(m, p + E, ps,
+        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.gate_proj.weight",
+                            c->prefix, L)), in, (size_t)hid, shared, hid, nT);
+    matvec_t_multi(m, p + E + shared, ps,
+        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.up_proj.weight",
+                            c->prefix, L)), in, (size_t)hid, shared, hid, nT);
+    matvec_t_multi(m, p + E + 2 * shared, ps,
+        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert_gate.weight",
+                            c->prefix, L)), in, (size_t)hid, 1, hid, nT);
+
+    int route[WASTE_CHUNK_MAX * 64];
+    float rw[WASTE_CHUNK_MAX * 64];
+    for (int t = 0; t < nT; t++) {
+        int *idx = route + (size_t)t * K;
+        float *w = rw + (size_t)t * K;
+        if (waste_qwen_moe_route(p + (size_t)t * ps, E, K, c->renorm,
+                                 idx, w, m->moe_prob, m->moe_used) != 0) {
+            PROF_END(P_QRTR);
+            return 0;
+        }
+        if (dump_route) {
+            FILE *df = fopen(dump_route, (dump_pos0 + t || L) ? "a" : "wb");
+            if (df) {
+                fprintf(df, "%d %d", dump_pos0 + t, L);
+                for (int j = 0; j < K; j++) fprintf(df, " %d", idx[j]);
+                for (int j = 0; j < K; j++) fprintf(df, " %.6g", w[j]);
+                for (int j = 0; j < K; j++) fprintf(df, " -1");
+                fputc('\n', df);
+                fclose(df);
+            }
+        }
+    }
+    PROF_END(P_QRTR);
+
+    memset(out, 0, (size_t)nT * hid * sizeof(float));
+    PROF_START(P_EMM);
+    const int ok = chunk_experts_staged(m, L, in, out, nT, K, inter, hid,
+                                        route, rw);
+    PROF_END(P_EMM);
+    if (!ok) return 0;
+
+    /* Shared experts are independent across tokens. Their gate/up inputs
+     * were projected above; the down projection is one batched matvec. */
+    PROF_START(P_QSHX);
+    for (int t = 0; t < nT; t++)
+        waste_act_pair_range(c, p + (size_t)t * ps + E,
+                             p + (size_t)t * ps + E + shared, shared);
+    matvec_t_multi(m, m->qattn, (size_t)hid,
+        waste_find(m, tname("%smodel.layers.%d.mlp.shared_expert.down_proj.weight",
+                            c->prefix, L)), p + E, ps, hid, shared, nT);
+    for (int t = 0; t < nT; t++) {
+        const float sg_raw = p[(size_t)t * ps + E + 2 * shared];
+        const float sg = 1.0f / (1.0f + expf(-sg_raw));
+        float *dst = out + (size_t)t * hid;
+        const float *src = m->qattn + (size_t)t * hid;
+        for (int i = 0; i < hid; i++) dst[i] += sg * src[i];
+    }
+    PROF_END(P_QSHX);
+    m->chunk_moe += nT;
+    return 1;
+}
+
 /* Which experts layer L+1 is about to route to, asked as soon as layer L's
  * MoE is back in the streams — so the reads it starts run under L+1's
  * attention instead of after its router.
@@ -9034,11 +9382,18 @@ static const float *qwen_prefill(waste_model *m, const int *tokens, int n, int p
          * measured slower: it gives up the staged kernel that puts ten
          * experts' rows across every thread at once, and the reads it saves
          * are cache hits by the time a prefill is warm. LEARNED §88. */
-        for (int t = 0; t < n && !m->read_error; t++) {
-            dump_pos0 = pos0 + t;
-            PROF_START(P_ROUTE);
-            qwen_moe_layer(m, L, m->qx + (size_t)t * hid, m->qblk + (size_t)t * hid, NULL);
-            PROF_END(P_ROUTE);
+        dump_pos0 = pos0;
+        PROF_START(P_ROUTE);
+        const int chunk_moe_done = qwen_moe_chunk(m, L, m->qx, m->qblk, n);
+        PROF_END(P_ROUTE);
+        if (!chunk_moe_done) {
+            for (int t = 0; t < n && !m->read_error; t++) {
+                dump_pos0 = pos0 + t;
+                PROF_START(P_ROUTE);
+                qwen_moe_layer(m, L, m->qx + (size_t)t * hid,
+                               m->qblk + (size_t)t * hid, NULL);
+                PROF_END(P_ROUTE);
+            }
         }
 
         {

@@ -58,6 +58,10 @@ typedef struct {
  * so a decode hint always fits; a prefill chunk names more and is clipped,
  * which costs read-ahead on the tail and nothing else. */
 #define WASTE_PF_MAX 64
+/* A small prefill tile can retain more records than one read-ahead window:
+ * 16 Qwen tokens name at most 160 distinct experts. Hints stay capped at
+ * 64 so the I/O queue remains bounded; explicit holds cover two windows. */
+#define WASTE_HOLD_MAX 256
 
 struct waste_eio;        /* opaque: the reader threads and their queue      */
 
@@ -98,7 +102,7 @@ typedef struct {
      * A layer that hands each of its top-k experts to a different thread
      * holds all k at once, so "the one the caller is using" stops being a
      * single slot. Released together by waste_ecache_release. */
-    int held[WASTE_PF_MAX];
+    int held[WASTE_HOLD_MAX];
     int n_held;
     uint64_t purged;                 /* slots the kernel reclaimed         */
     uint64_t filled;                 /* records the background fill read   */
@@ -142,7 +146,7 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
  * as the next arrives, and on macOS a released slot is volatile — the
  * kernel may drop it and the reader would see zeros rather than weights.
  *
- * Holds at most WASTE_PF_MAX; returns NULL if the set is full or the read
+ * Holds at most WASTE_HOLD_MAX; returns NULL if the set is full or the read
  * failed. Every hold must be matched by one waste_ecache_release, which
  * releases the whole set. Not for concurrent use: collect on one thread,
  * then read the pointers from many. */

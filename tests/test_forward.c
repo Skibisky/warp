@@ -111,10 +111,10 @@ int main(int argc, char **argv)
     printf("prefill %d tok in %.2fs (%.2f tok/s); argmax %d, max %.4f\n",
            n, tp, n / tp, best, lg[best]);
     {
-        long ccalls = 0, ctokens = 0, cgdn = 0, cqsa = 0;
-        waste_model_chunk_stats(&m, &ccalls, &ctokens, &cgdn, &cqsa);
-        printf("chunked %ld tok in %ld calls, gdn %ld, qsa %ld\n",
-               ctokens, ccalls, cgdn, cqsa);
+        long ccalls = 0, ctokens = 0, cgdn = 0, cmoe = 0, cqsa = 0;
+        waste_model_chunk_stats(&m, &ccalls, &ctokens, &cgdn, &cmoe, &cqsa);
+        printf("chunked %ld tok in %ld calls, gdn %ld, moe %ld, qsa %ld\n",
+               ctokens, ccalls, cgdn, cmoe, cqsa);
     }
     if (m.cfg.arch_qwen && m.has_qsa) {
         const int compress = m.cfg.idx_compress > 0 ? m.cfg.idx_compress : 4;

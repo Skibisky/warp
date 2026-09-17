@@ -768,7 +768,7 @@ const uint8_t *waste_ecache_get(waste_ecache *c, int layer, int expert,
 const uint8_t *waste_ecache_hold(waste_ecache *c, int layer, int expert,
                                  waste_fetch_fn fetch, void *user)
 {
-    if (c->n_slots <= 0 || c->n_held >= WASTE_PF_MAX) return NULL;
+    if (c->n_slots <= 0 || c->n_held >= WASTE_HOLD_MAX) return NULL;
     const uint8_t *r = waste_ecache_get(c, layer, expert, fetch, user);
     if (!r) return NULL;
     /* get() parked it in last_used, which the *next* get would release.

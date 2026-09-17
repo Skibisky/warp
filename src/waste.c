@@ -611,6 +611,20 @@ waste_status waste_plan_memory(const char *model_path, uint32_t ctx_tokens,
         sc += kt * ((uint64_t)2 * moe_inter + lat) * 4;     /* xga/xub/xacc */
         sc += kt * lut * 4;                                 /* m->xlut  */
         sc += kt * (lut + nsc * 4);                         /* xlut8/xqs */
+        /* Optional chunk-native staging, bounded at 16 tokens. Do not tax
+         * the ordinary cache budget for experiment scratch it never
+         * allocates. The sweep setter is intentionally a test escape hatch;
+         * a configured run names the tile in its environment before plan. */
+        const char *cte = getenv("WASTE_CHUNK_MOE_TILE");
+        if (cte && atoi(cte) > 0) {
+            int ct = atoi(cte);
+            if (ct > 16) ct = 16;
+            const uint64_t cp = (uint64_t)ct * kt;
+            sc += cp * ((uint64_t)2 * moe_inter + lat) * 4;
+            sc += cp * lut * 4;
+            sc += cp * (lut + nsc * 4 + sizeof(void *));
+            sc += (uint64_t)(2 * ct) * (lut * 4 + lut + nsc * 4);
+        }
     }
     sc += ((uint64_t)T * (2 * moe_inter * n_shared_eff + hidden) + 64) * 4;
     sc += (uint64_t)T * (2 * lat + 2 * hidden) * 4;
