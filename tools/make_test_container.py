@@ -549,6 +549,8 @@ def write_tokenizer(outdir):
 def write_qwen_container(args, rng):
     """A structurally valid Qwen text fixture. Format v0, WEXP unchanged."""
     cfg = dict(QWEN_CFG)
+    if getattr(args, "shared_inter", None):
+        cfg["shared_expert_intermediate_size"] = args.shared_inter
     hid = cfg["hidden_size"]
     moe = cfg["moe_intermediate_size"]
     hc, lr = cfg["hc_count"], cfg["hc_lowrank"]
@@ -596,9 +598,10 @@ def write_qwen_container(args, rng):
             t.f32(a + "indexer.k_layernorm.weight", [cfg["indexer_head_dim"]])
         m = p + "mlp."
         t.quant(m + "gate.weight", [cfg["num_experts"], hid])
-        t.quant(m + "shared_expert.gate_proj.weight", [moe, hid])
-        t.quant(m + "shared_expert.up_proj.weight", [moe, hid])
-        t.quant(m + "shared_expert.down_proj.weight", [hid, moe])
+        sh = int(cfg.get("shared_expert_intermediate_size") or moe)
+        t.quant(m + "shared_expert.gate_proj.weight", [sh, hid])
+        t.quant(m + "shared_expert.up_proj.weight", [sh, hid])
+        t.quant(m + "shared_expert.down_proj.weight", [hid, sh])
         t.quant(m + "shared_expert_gate.weight", [1, hid])
         if L == 1:
             pe = cfg["ple_embed_dim"]
@@ -794,6 +797,10 @@ def main():
     ap.add_argument("--qwen", action="store_true",
                     help="a tiny Qwen3.8-Flash-Next text fixture: packed-MoE "
                          "WEXP banks, GDN/QSA/HC names, 16 on-disk PLE heads")
+    ap.add_argument("--shared-inter", type=int, metavar="N",
+                    help="shared_expert_intermediate_size; the shared tensors "
+                         "are emitted at this width, so a value wider than the "
+                         "routed width yields a real Qwen2-57B-shaped container")
     args = ap.parse_args()
     if args.index_bits == 6:
         # The engine validates index_bits 6 only as 4 stages of 64 entries

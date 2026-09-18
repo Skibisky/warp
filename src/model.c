@@ -1932,8 +1932,7 @@ static int cfg_sane(const waste_config *c)
          * (model.c:3272), so a container whose shared width exceeds both
          * writes past the buffer. Flash-Next fits exactly (640 = 640),
          * which is why nothing noticed (#69). */
-        if (c->shared_inter > (c->dense_inter > c->moe_inter
-                               ? c->dense_inter : c->moe_inter)) return 0;
+
     }
     if (c->n_experts && c->moe_inter < 1) return 0;
     if ((!c->n_experts || c->first_dense) && c->dense_inter < 1) return 0;
@@ -3286,7 +3285,20 @@ int waste_model_load(waste_model *m, const char *dir, int kv_cap,
         m->mrow = (float *)calloc(n, sizeof(float));
     }
     m->logits = (float *)calloc((size_t)c->vocab, sizeof(float));
-    m->ff = (float *)calloc((size_t)2 * (c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter), sizeof(float));
+    {
+        /* m->ff batches the gate and up projections of whichever expert is
+         * widest. The shared expert writes 2*shared_in (qwen_moe_layer), so
+         * sizing this from the dense and routed widths alone overflows on any
+         * container whose shared width exceeds both. Qwen2-57B-A14B ships
+         * exactly that shape (shared 20480 > max(dense 18944, moe 2560)), so
+         * the buffer has to follow the shared width rather than the manifest
+         * being refused. Flash-Next fits exactly (640 == 640), which is why
+         * nothing noticed (#69). */
+        int ff_w = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+        const int shared_w = c->shared_inter ? c->shared_inter : c->moe_inter;
+        if (shared_w > ff_w) ff_w = shared_w;
+        m->ff = (float *)calloc((size_t)2 * ff_w, sizeof(float));
+    }
     m->e_gate = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_up = (float *)malloc((size_t)c->moe_inter * c->hidden * sizeof(float));
     m->e_down = (float *)malloc((size_t)c->hidden * c->moe_inter * sizeof(float));

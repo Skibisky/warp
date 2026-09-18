@@ -1818,12 +1818,31 @@ PYQ
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["layer_types"]=m["config"]["layer_types"][:1];json.dump(m,open(p,"w"))'
         qwen_refused "a PLE conv kernel the ring cannot hold" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ple_conv_kernel_size"]=0;json.dump(m,open(p,"w"))'
-        qwen_refused "a shared expert wider than the buffer it writes into" \
-            'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["shared_expert_intermediate_size"]=512;json.dump(m,open(p,"w"))'
         qwen_refused "an n-gram order of one, where the PLE width divides by zero" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["ngram_size"]=1;json.dump(m,open(p,"w"))'
         qwen_refused "a linear conv kernel of zero, an empty GDN ring" \
             'import json,sys;p=sys.argv[1]+"/manifest.json";m=json.load(open(p));m["config"]["linear_conv_kernel_dim"]=0;json.dump(m,open(p,"w"))'
+
+        # Qwen2-57B-A14B ships shared 20480 against max(dense 18944, moe 2560),
+        # so a shared expert wider than both is a real checkpoint shape and must
+        # load. Before m->ff followed the shared width this container overflowed
+        # the buffer; a guard that refused it would lock out a published model.
+        wide="$TMP/qwen-wide.waste"
+        rm -rf "$wide"
+        if python3 tools/make_test_container.py --qwen --shared-inter 48 \
+               "$wide" >/dev/null 2>&1 \
+           && cc -O1 -std=gnu11 -Isrc -o "$TMP/wide_step" tests/wide_step.c \
+                 libwaste.a -lm -lpthread >/dev/null 2>&1; then
+            # info alone only reads the manifest; the overflow needs a decode
+            # step, so drive one through waste_eval with raw token ids.
+            if "$TMP/wide_step" "$wide" >/dev/null 2>&1; then
+                ok "a shared expert wider than the routed width decodes"
+            else
+                no "a shared expert wider than the routed width crashed"
+            fi
+        else
+            sk "wide shared expert" "fixture or harness did not build"
+        fi
     fi
 
     # The isolated ops against an independent PyTorch reference written
